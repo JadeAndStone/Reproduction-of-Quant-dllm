@@ -1,0 +1,59 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+conda-meta/
+
+# Logs and runtime outputs
+logs/
+*.log
+nohup.out
+
+# Quantization / evaluation artifacts
+outputs/
+benchmark_results/
+offload/
+mineru_test/
+
+# Large model and tensor artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+*.npz
+*.npy
+
+# Local datasets and Hugging Face caches
+data/
+datasets/
+hf_eval/
+hf_shared/
+files/
+c4-train/
+*.jsonl
+*.jsonl.gz
+*.json.gz
+*.arrow
+*.parquet
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# One-off local debug scripts
+debug_*.py

@@ -10,11 +10,8 @@ import torch
 from transformers import AutoTokenizer
 
 MASK_TOKEN = "<|mdm_mask|>"
-MODEL_PATH = "/root/data-fs/.cache/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/LLaDA-8B-Base"
-C4_TRAIN_URL = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
 
-
-def build_tokenizer(model_path=MODEL_PATH, local_files_only=False):
+def build_tokenizer(model_path, local_files_only=False):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         use_fast=False,
@@ -27,12 +24,24 @@ def build_tokenizer(model_path=MODEL_PATH, local_files_only=False):
     return tokenizer, mask_token_id
 
 
-def linear_mask(t, num_steps):
-    return t / num_steps
+def linear_mask(tau):
+    return 1.0 - tau
 
 
-def cosine_mask(t, num_steps):
-    return 0.5 * (1 - torch.cos(torch.tensor(t / num_steps) * torch.pi)).item()
+def cosine_mask(tau):
+    return 0.5 * (1 + torch.cos(torch.tensor(tau) * torch.pi)).item()
+
+
+def build_timestep_grid(num_steps, include_full_visible=True):
+    if num_steps <= 0:
+        raise ValueError("MCS needs at least one mask state. Use --num-steps > 0.")
+
+    if include_full_visible:
+        if num_steps == 1:
+            return [0.0]
+        return torch.linspace(0.0, 1.0, num_steps, dtype=torch.float32).tolist()
+
+    return torch.linspace(0.0, 1.0, num_steps + 1, dtype=torch.float32)[1:].tolist()
 
 
 @contextmanager
@@ -47,7 +56,7 @@ def open_gzip_jsonl(source):
             yield gzip_file
 
 
-def iter_c4_text(source=C4_TRAIN_URL):
+def iter_c4_text(source):
     with open_gzip_jsonl(source) as gzip_file:
         for line in gzip_file:
             if not line:
@@ -55,7 +64,7 @@ def iter_c4_text(source=C4_TRAIN_URL):
             yield json.loads(line)["text"]
 
 
-def get_c4(nsamples, seed, seqlen, source=C4_TRAIN_URL, model_path=MODEL_PATH, max_docs=None):
+def get_c4(nsamples, seed, seqlen, source, model_path, max_docs):
     tokenizer, _ = build_tokenizer(model_path=model_path, local_files_only=Path(model_path).exists())
     rng = random.Random(seed)
     trainloader = []
@@ -83,71 +92,75 @@ def get_c4(nsamples, seed, seqlen, source=C4_TRAIN_URL, model_path=MODEL_PATH, m
     return trainloader
 
 
-def MCS(dataloader, num_steps, gama, maskratio_func, mask_token_id):
+def MCS(
+    dataloader,
+    num_steps,
+    gama,
+    maskratio_func,
+    mask_token_id,
+    include_full_visible=True,
+    seed=None,
+):
     calibset = []
+    timestep_grid = build_timestep_grid(
+        num_steps,
+        include_full_visible=include_full_visible,
+    )
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(seed)
 
     for sentence in dataloader:
         data = sentence.squeeze(0)
         length = data.numel()
         prefix_len = int(gama * length)
 
-        for t in range(num_steps + 1):
-            visible_prob = float(maskratio_func(t, num_steps))
+        for tau in timestep_grid:
+            visible_prob = float(maskratio_func(tau))
 
             masked_data = data.clone()
             if prefix_len < length:
                 visible = torch.bernoulli(
-                    torch.full((length - prefix_len,), visible_prob, dtype=torch.float32)
+                    torch.full((length - prefix_len,), visible_prob, dtype=torch.float32),
+                    generator=generator,
                 ).bool()
                 masked_data[prefix_len:][~visible] = mask_token_id
 
             calibset.append(masked_data.unsqueeze(0))
-    return calibset
+    return calibset, len(timestep_grid)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=MODEL_PATH)
-    parser.add_argument("--source", default=C4_TRAIN_URL, help="C4 .json.gz URL or local path.")
-    parser.add_argument("--nsamples", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--seqlen", type=int, default=4096)
-    parser.add_argument("--num-steps", type=int, default=20)
-    parser.add_argument("--gamma", type=float, default=0.25)
-    parser.add_argument("--schedule", choices=["linear", "cosine"], default="linear")
-    parser.add_argument("--max-docs", type=int, default=None)
-    return parser.parse_args()
 
+def get_calib(model_path,nsamples,
+              seed,seqlen,
+              num_steps,gamma,
+              schedule,
+              max_docs,source,
+              include_full_visible=True):
 
-def get_calib():
-    args = parse_args()
     _, mask_token_id = build_tokenizer(
-        model_path=args.model,
-        local_files_only=Path(args.model).exists(),
+        model_path=model_path,
+        local_files_only=Path(model_path).exists(),
     )
-    schedule = linear_mask if args.schedule == "linear" else cosine_mask
+    schedule = linear_mask if schedule == "linear" else cosine_mask
 
     trainloader = get_c4(
-        nsamples=args.nsamples,
-        seed=args.seed,
-        seqlen=args.seqlen,
-        source=args.source,
-        model_path=args.model,
-        max_docs=args.max_docs,
+        nsamples=nsamples,
+        seed=seed,
+        seqlen=seqlen,
+        source=source,
+        model_path=model_path,
+        max_docs=max_docs,
     )
-    calibset = MCS(trainloader, args.num_steps, args.gamma, schedule, mask_token_id)
+    calibset, mcs_step_count = MCS(
+        trainloader,
+        num_steps,
+        gamma,
+        schedule,
+        mask_token_id,
+        include_full_visible=include_full_visible,
+        seed=seed,
+    )
 
-    return args, trainloader, calibset
+    return trainloader, calibset, mcs_step_count
     # calibset: List[tokens1,tokens2,...]
-    
-def main():
-    args, trainloader, calibset = get_calib()
-    print("c4_samples:", len(trainloader))
-    print("mcs_samples:", len(calibset))
-    print("sample_shape:", tuple(calibset[0].shape))
-    for i in range(min(args.num_steps + 1, len(calibset))):
-        print(i, calibset[i][:, :50])
-
-
-if __name__ == "__main__":
-    main()
