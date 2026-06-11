@@ -99,3 +99,76 @@ bash scripts/exp_cross_model_template.sh
 ```
 
 Only use this after LLaDA-8B-Base results and ablations are stable.
+
+## 5. Layer-wise / stage-wise Quant-dLLM pipelines
+
+The reproduction now includes two calibration-aware PTQ pipelines under `tools/`:
+
+- `tools/quant_layerwise_pipeline.py`: paper-aligned layer-wise pipeline. It computes MCS/SMCS statistics, ABMP bit allocation, and DAQ quantization for each target transformer block while propagating quantized hidden states block by block.
+- `tools/quant_stagewise_pipeline.py`: diagnostic block-internal stage-wise variant. It quantizes `q/k/v`, `attn_out`, `ff_in`, and `ff_out` sequentially inside each transformer block and is useful for ablations, but the paper text is closer to the layer-wise pipeline.
+
+Recommended paper-aligned pilot / full run uses tile-level DAQ and tile-level ABMP:
+
+```bash
+cd /root/data-fs/Quant-dllm
+
+RUN_ID=layerwise_tiledaq_tileabmp_n128_s4096_t20_no_full_visible_end2_$(date +%Y%m%d_%H%M%S) \
+PYTHON_BIN=/root/data-tmp/envs/qdlm/bin/python \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+END_BLOCK=2 \
+RUN_EVAL=0 \
+bash scripts/remote_layerwise_tile_pilot.sh
+```
+
+Run the full 32-block version with smoke evaluation:
+
+```bash
+cd /root/data-fs/Quant-dllm
+
+RUN_ID=layerwise_tiledaq_tileabmp_n128_s4096_t20_no_full_visible_full_$(date +%Y%m%d_%H%M%S) \
+PYTHON_BIN=/root/miniconda3/envs/qdlm/bin/python \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+END_BLOCK=32 \
+RUN_EVAL=1 \
+EVAL_TASKS=winogrande,piqa,arc_challenge,gsm8k \
+EVAL_LIMIT=200 \
+GPU_MEMORY=13GiB \
+bash scripts/remote_layerwise_tile_pilot.sh
+```
+
+Stage-wise diagnostic run:
+
+```bash
+cd /root/data-fs/Quant-dllm
+
+RUN_ID=stagewise_tiledaq_tileabmp_n128_s4096_t20_no_full_visible_$(date +%Y%m%d_%H%M%S) \
+PYTHON_BIN=/root/miniconda3/envs/qdlm/bin/python \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+DAQ_GRANULARITY=tile \
+ABMP_GRANULARITY=tile \
+ABMP_RANK_SCOPE=weight \
+RUN_EVAL=1 \
+EVAL_TASKS=winogrande,piqa,arc_challenge,gsm8k \
+EVAL_LIMIT=200 \
+GPU_MEMORY=13GiB \
+bash scripts/local_stagewise_quant_eval.sh
+```
+
+Monitoring pattern:
+
+```bash
+cd /root/data-fs/Quant-dllm
+LOG=$(ls -t logs/<run_id_prefix>*.log | head -1)
+tail -f "$LOG"
+
+PIDFILE=$(ls -t logs/<run_id_prefix>*.pid | head -1)
+PID=$(cat "$PIDFILE")
+ps -p "$PID" -o pid,ppid,sid,stat,pcpu,pmem,etime,cmd
+nvidia-smi
+```
+
+Notes:
+
+- `mcs_no_full_visible`, `nsamples=128`, `seqlen=4096`, and `num_steps=20` are the default paper-aligned calibration settings used by these scripts.
+- On local 16GB V100s, `GPU_MEMORY=13GiB` is more stable during `device_map=auto` model loading than `15GiB`.
+- `EVAL_LIMIT` is for smoke tests only and should not be compared directly with full benchmark results.
