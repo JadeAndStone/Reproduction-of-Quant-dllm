@@ -10,12 +10,14 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
-from DAQ.quantizer import DAQ, build_imp_mask
+from DAQ.quantizer import DAQ, DAQ_full_s_refine_fixed_b, build_imp_mask
 from utils.generate_imp_mat import (
     build_imp_mat_from_mcs,
     get_mcs_mat,
+    inverse_diag_adaptive,
     load_weight_from_checkpoint,
     load_weight_map,
+    resolve_damping_value,
 )
 
 MODEL_PATH = "/root/data-fs/.cache/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/LLaDA-8B-Base"
@@ -47,6 +49,13 @@ def parse_args():
     parser.add_argument("--allocate_ratio", type=float, default=0.05)
     parser.add_argument("--damping", type=float, default=0.01)
     parser.add_argument(
+        "--damping_mode",
+        choices=["absolute", "diag_mean"],
+        default="absolute",
+        help="Damping mode for SMCS inverse: fixed absolute value or damp_percent * mean(diag(S)).",
+    )
+    parser.add_argument("--damp_percent", type=float, default=0.01)
+    parser.add_argument(
         "--mcs_normalization",
         choices=["tokens", "mcs_steps"],
         default="tokens",
@@ -62,7 +71,8 @@ def parse_args():
         help="Scope used to compute the DOR 3-sigma importance mask: per DAQ unit or full Linear weight.",
     )
     parser.add_argument("--daq_component", choices=["custom", "baseline", "rsr_no_dor", "rsr_w_dor"], default="custom")
-    parser.add_argument("--daq_row_center", action="store_true", help="Apply per-weight-row centering before DAQ and add row mean back after quantization.")
+    parser.add_argument("--daq_row_center", action="store_true", help="Apply full-weight per-row centering before block DAQ and add the full row mean back after quantization.")
+    parser.add_argument("--daq_block_row_center", action="store_true", help="For block-level DAQ, apply per-DAQ-unit row centering inside each quantization block instead of centering the full Linear weight first.")
     parser.add_argument("--z_row_center", action="store_true", help="Build Z from row-centered weights using the same granularity as DAQ.")
     parser.add_argument("--start_block", type=int, default=0)
     parser.add_argument("--end_block", type=int, default=None)
@@ -82,11 +92,52 @@ def parse_args():
     parser.add_argument("--gpu_memory", default="13GiB")
     parser.add_argument("--cpu_memory", default="80GiB")
     parser.add_argument("--offload_folder", default="/tmp/llada_offload")
-    parser.add_argument("--daq_granularity", choices=["weight", "row", "column", "tile"], default="transformer_block")
+    parser.add_argument("--daq_granularity", choices=["weight", "row", "column", "tile"], default="column")
     parser.add_argument("--abmp_granularity", choices=["weight", "row", "column", "tile"], default=None)
     parser.add_argument("--abmp_rank_scope", choices=["global", "transformer_block", "weight"], default="weight")
     parser.add_argument("--quant_block_size", type=int, default=128)
     parser.add_argument("--daq_device", default="cpu")
+    parser.add_argument(
+        "--daq_activation_diag",
+        action="store_true",
+        help=(
+            "Diagnostic experiment: include activation covariance diagonal in DAQ "
+            "alpha updates, minimizing diag(X^T X)-weighted weight error inside each unit."
+        ),
+    )
+    parser.add_argument(
+        "--daq_activation_diag_mode",
+        choices=["activation", "dor_activation"],
+        default="dor_activation",
+        help="Solve weight for --daq_activation_diag: diag only or DOR mask squared times diag.",
+    )
+    parser.add_argument(
+        "--gptq_compensation",
+        action="store_true",
+        help=(
+            "Apply GPTQ/OBC-style block-wise compensation. Requires full SMCS "
+            "covariances; supported by layerwise/stagewise pipelines."
+        ),
+    )
+    parser.add_argument("--gptq_compensation_device", default="cuda:0")
+    parser.add_argument(
+        "--daq_fulls_refine",
+        action="store_true",
+        help=(
+            "Apply fixed-B full-S scale refinement after DAQ for selected Linear weights. "
+            "Requires full SMCS covariances from layerwise/stagewise pipelines."
+        ),
+    )
+    parser.add_argument("--daq_fulls_device", default="cuda:0")
+    parser.add_argument("--daq_fulls_steps", type=int, default=3)
+    parser.add_argument("--daq_fulls_ridge", type=float, default=1e-5)
+    parser.add_argument(
+        "--daq_fulls_target_modules",
+        default="ff_proj,up_proj,ff_out",
+        help="Comma-separated module short names to refine; empty means all target Linear weights.",
+    )
+    parser.add_argument("--daq_fulls_start_block", type=int, default=0)
+    parser.add_argument("--daq_fulls_end_block", type=int, default=None)
     parser.add_argument("--log_unit_interval", type=int, default=0)
     return parser.parse_args()
 
@@ -260,6 +311,13 @@ def validate_granularity_args(args):
         raise ValueError("--quant_block_size must be positive for block-level DAQ.")
     if args.abmp_granularity != "weight" and args.quant_block_size <= 0:
         raise ValueError("--quant_block_size must be positive for block-level ABMP.")
+    if getattr(args, "gptq_compensation", False):
+        if args.daq_granularity != "column":
+            raise ValueError("--gptq_compensation currently requires --daq_granularity column.")
+        if args.abmp_granularity not in ("weight", "column"):
+            raise ValueError("--gptq_compensation requires --abmp_granularity weight or column.")
+        if args.daq_row_center or args.daq_block_row_center or args.z_row_center:
+            raise ValueError("--gptq_compensation does not support row-centering variants.")
 
 
 def precision_lookup_key_for_unit(weight_name, shape, row_slice, col_slice, abmp_granularity):
@@ -376,6 +434,8 @@ def build_z_cache(args, model, weight_map, block_map, z_cache_dir):
                 row_center_granularity=args.daq_granularity,
                 row_center_block_size=args.quant_block_size,
                 inverse_diag_floor=args.inverse_diag_floor,
+                damping_mode=args.damping_mode,
+                damp_percent=args.damp_percent,
             )
             block_tensors[name] = z_tensor.to(quant_dtype(args.z_save_dtype)).contiguous()
             del z_tensor
@@ -446,12 +506,74 @@ def resolve_daq_component_params(args):
     return args.daq_steps, args.imp_lamda
 
 
-def run_daq_unit(weight, imp_mat, bits, args, apply_row_center=True, imp_mask=None):
-    device = torch.device(args.daq_device)
+def module_short_name(weight_name):
+    return weight_name.split(".")[-2]
+
+
+def block_idx_from_weight_name(weight_name):
+    parts = weight_name.split(".")
+    if len(parts) >= 4 and parts[:3] == ["model", "transformer", "blocks"]:
+        return int(parts[3])
+    return None
+
+
+def parse_csv_set(value):
+    return {item.strip() for item in str(value or "").split(",") if item.strip()}
+
+
+def should_apply_fulls_refine(args, weight_name):
+    if not getattr(args, "daq_fulls_refine", False):
+        return False
+    block_idx = block_idx_from_weight_name(weight_name)
+    if block_idx is not None:
+        if block_idx < getattr(args, "daq_fulls_start_block", 0):
+            return False
+        end_block = getattr(args, "daq_fulls_end_block", None)
+        if end_block is not None and block_idx >= end_block:
+            return False
+    targets = parse_csv_set(getattr(args, "daq_fulls_target_modules", ""))
+    return not targets or module_short_name(weight_name) in targets
+
+
+def run_daq_unit(
+    weight,
+    imp_mat,
+    bits,
+    args,
+    apply_row_center=True,
+    imp_mask=None,
+    activation_diag=None,
+    fulls_hessian=None,
+):
+    if fulls_hessian is not None and getattr(args, "daq_fulls_refine", False):
+        device = _device_or_cpu(getattr(args, "daq_fulls_device", args.daq_device))
+    else:
+        device = torch.device(args.daq_device)
     daq_steps, imp_lamda = resolve_daq_component_params(args)
-    weight_device = weight.to(device)
-    imp_device = imp_mat.to(device)
+    fulls_enabled_for_unit = fulls_hessian is not None and getattr(args, "daq_fulls_refine", False)
+    unit_dtype = torch.float32 if fulls_enabled_for_unit else weight.dtype
+    weight_device = weight.to(device=device, dtype=unit_dtype)
+    imp_device = imp_mat.to(device=device, dtype=unit_dtype)
     mask_device = imp_mask.to(device) if imp_mask is not None else None
+    activation_diag_device = activation_diag.to(device=device, dtype=weight_device.dtype) if activation_diag is not None else None
+    fulls_hessian_device = (
+        fulls_hessian.to(device=device, dtype=torch.float32).contiguous()
+        if fulls_enabled_for_unit
+        else None
+    )
+
+    solve_weight = None
+    if getattr(args, "daq_activation_diag", False):
+        if activation_diag_device is None:
+            raise ValueError("--daq_activation_diag requires activation_diag/cov data for each DAQ unit.")
+        diag = activation_diag_device.clamp_min(0).reshape(1, -1)
+        if getattr(args, "daq_activation_diag_mode", "dor_activation") == "activation":
+            solve_weight = diag.expand_as(weight_device)
+        elif getattr(args, "daq_activation_diag_mode", "dor_activation") == "dor_activation":
+            base_mask = mask_device if mask_device is not None else build_imp_mask(imp_device, imp_lamda)
+            solve_weight = (base_mask**2) * diag
+        else:
+            raise ValueError(f"Unsupported daq_activation_diag_mode: {args.daq_activation_diag_mode}")
 
     row_mean = None
     daq_weight = weight_device
@@ -459,19 +581,34 @@ def run_daq_unit(weight, imp_mat, bits, args, apply_row_center=True, imp_mask=No
         row_mean = weight_device.mean(dim=1, keepdim=True)
         daq_weight = weight_device - row_mean
 
-    quantized = DAQ(
-        weight=daq_weight,
-        imp_mat=imp_device,
-        bits=bits,
-        daq_steps=daq_steps,
-        lamda=imp_lamda,
-        imp_mask=mask_device,
-    )
+    if fulls_hessian_device is not None:
+        quantized = DAQ_full_s_refine_fixed_b(
+            weight=daq_weight,
+            imp_mat=imp_device,
+            bits=bits,
+            daq_steps=daq_steps,
+            lamda=imp_lamda,
+            hessian=fulls_hessian_device,
+            fulls_steps=getattr(args, "daq_fulls_steps", 3),
+            fulls_ridge=getattr(args, "daq_fulls_ridge", 1e-5),
+            imp_mask=mask_device,
+            solve_weight=solve_weight,
+        )
+    else:
+        quantized = DAQ(
+            weight=daq_weight,
+            imp_mat=imp_device,
+            bits=bits,
+            daq_steps=daq_steps,
+            lamda=imp_lamda,
+            imp_mask=mask_device,
+            solve_weight=solve_weight,
+        )
     if row_mean is not None:
         quantized = quantized + row_mean
 
     quantized_cpu = quantized.detach().cpu()
-    del weight_device, imp_device, mask_device, daq_weight, row_mean, quantized
+    del weight_device, imp_device, mask_device, activation_diag_device, fulls_hessian_device, solve_weight, daq_weight, row_mean, quantized
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return quantized_cpu
@@ -492,12 +629,424 @@ def precision_bit_counts(args, units, precision_map, weight_name, shape, default
     return counts
 
 
-def quantize_blocks_from_cache(args, weight_map, block_map, precision_map, z_cache_dir):
+def _device_or_cpu(device_name):
+    if str(device_name).startswith("cuda") and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def compute_inverse_chol_upper_from_cov(args, cov, normalizer, context):
+    if normalizer is None or float(normalizer) <= 0:
+        raise ValueError(f"{context}: invalid SMCS normalizer {normalizer}.")
+
+    device = _device_or_cpu(args.gptq_compensation_device)
+    work = cov.to(device=device, dtype=torch.float32) / float(normalizer)
+    if not torch.isfinite(work).all():
+        raise FloatingPointError(f"{context}: covariance contains non-finite values.")
+
+    work = 0.5 * (work + work.T)
+    eye = torch.eye(work.shape[0], dtype=torch.float32, device=device)
+    requested_damping = resolve_damping_value(
+        work,
+        args.damping,
+        damping_mode=args.damping_mode,
+        damp_percent=args.damp_percent,
+    )
+    if requested_damping < 0:
+        raise ValueError(f"{context}: damping must be non-negative, got {requested_damping}.")
+
+    current_damping = float(requested_damping)
+    last_error = None
+    for attempt in range(9):
+        try:
+            damped = work + current_damping * eye
+            chol = torch.linalg.cholesky(damped)
+            inverse = torch.cholesky_inverse(chol)
+            inverse = 0.5 * (inverse + inverse.T)
+            inverse_diag = torch.diagonal(inverse)
+            finite = torch.isfinite(inverse_diag).all()
+            positive = bool((inverse_diag > args.inverse_diag_floor).all().item()) if finite else False
+            if finite and positive:
+                inverse_chol_upper = torch.linalg.cholesky(inverse, upper=True)
+                info = {
+                    "requested_damping": float(requested_damping),
+                    "used_damping": float(current_damping),
+                    "attempts": attempt + 1,
+                    "inverse_factor_device": str(device),
+                    "diag_min": float(inverse_diag.min().item()),
+                    "diag_max": float(inverse_diag.max().item()),
+                    "diag_mean": float(inverse_diag.mean().item()),
+                    "cov_diag_mean": float(torch.diagonal(work).mean().item()),
+                }
+                if float(current_damping) != float(requested_damping):
+                    print(
+                        f"  {context}: adaptive damping "
+                        f"{float(requested_damping):.6e} -> {float(current_damping):.6e}",
+                        flush=True,
+                    )
+                return inverse_diag.detach().cpu(), inverse_chol_upper.detach().cpu(), info
+            diag_min = (
+                float(inverse_diag[torch.isfinite(inverse_diag)].min().item())
+                if torch.isfinite(inverse_diag).any()
+                else float("nan")
+            )
+            last_error = (
+                f"inverse diagonal check failed: finite={bool(finite.item())}, "
+                f"min={diag_min:.6e}, floor={args.inverse_diag_floor:.6e}"
+            )
+        except RuntimeError as exc:
+            last_error = str(exc)
+        finally:
+            for var_name in ("damped", "chol", "inverse", "inverse_diag", "inverse_chol_upper"):
+                if var_name in locals():
+                    del locals()[var_name]
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        current_damping = current_damping * 10.0 if current_damping > 0 else args.inverse_diag_floor
+
+    raise FloatingPointError(
+        f"{context}: failed to build GPTQ inverse factor after 9 attempts; "
+        f"last damping={current_damping:.6e}; {last_error}"
+    )
+
+
+def build_z_from_inverse_diag(args, weight_name, inverse_diag, weight_map):
+    scale = 1.0 / inverse_diag.clamp_min(args.inverse_diag_floor)
+    weight = load_weight_from_checkpoint(weight_name, weight_map, args.model_path)
+    z_tensor = (weight.to(torch.float32) * scale.unsqueeze(0)) ** 2
+    if not torch.isfinite(z_tensor).all():
+        bad = int((~torch.isfinite(z_tensor)).sum().item())
+        raise FloatingPointError(f"{weight_name}: Z contains {bad} non-finite values.")
+    del weight, scale
+    return z_tensor.to(torch.float32).contiguous()
+
+
+def compute_z_and_inverse_factor(args, weight_name, cov, normalizer, weight_map):
+    inverse_diag, inverse_chol_upper, inverse_info = compute_inverse_chol_upper_from_cov(
+        args,
+        cov,
+        normalizer,
+        weight_name,
+    )
+    z_tensor = build_z_from_inverse_diag(args, weight_name, inverse_diag, weight_map)
+    del inverse_diag
+    return z_tensor, inverse_info, inverse_chol_upper
+
+
+def quantize_weight_independent_units(
+    args,
+    weight_name,
+    W,
+    Z,
+    units,
+    precision_map,
+    weight_imp_mask,
+    activation_diag=None,
+    cov=None,
+    normalizer=None,
+):
+    if args.daq_block_row_center:
+        if args.daq_row_center:
+            raise ValueError("--daq_row_center and --daq_block_row_center are mutually exclusive for block-level DAQ.")
+        row_mean = None
+        daq_source = W
+        apply_unit_row_center = True
+    elif args.daq_row_center:
+        row_mean = W.mean(dim=1, keepdim=True)
+        daq_source = W - row_mean
+        apply_unit_row_center = False
+    else:
+        row_mean = None
+        daq_source = W
+        apply_unit_row_center = False
+
+    apply_fulls_refine = should_apply_fulls_refine(args, weight_name)
+    if apply_fulls_refine:
+        if cov is None or normalizer is None:
+            raise ValueError(f"{weight_name}: --daq_fulls_refine requires covariance and normalizer.")
+        if args.daq_granularity == "weight":
+            print(f"  full-S fixed-B refinement enabled for {weight_name} at full-weight granularity", flush=True)
+        else:
+            print(f"  full-S fixed-B refinement enabled for {weight_name}", flush=True)
+
+    Q = torch.empty_like(W)
+    for unit_idx, (unit_key, row_slice, col_slice) in enumerate(units, start=1):
+        precision_lookup_key = precision_lookup_key_for_unit(
+            weight_name,
+            W.shape,
+            row_slice,
+            col_slice,
+            args.abmp_granularity,
+        )
+        bits = get_precision_bits(
+            precision_map,
+            weight_name,
+            precision_lookup_key,
+            args.default_bits,
+        )
+        unit_imp_mask = (
+            weight_imp_mask[row_slice, col_slice].contiguous()
+            if weight_imp_mask is not None
+            else None
+        )
+        unit_activation_diag = (
+            activation_diag[col_slice].contiguous()
+            if activation_diag is not None
+            else None
+        )
+        unit_fulls_hessian = (
+            (cov[col_slice, col_slice].to(torch.float32) / float(normalizer)).contiguous()
+            if apply_fulls_refine
+            else None
+        )
+        Q[row_slice, col_slice] = run_daq_unit(
+            daq_source[row_slice, col_slice].contiguous(),
+            Z[row_slice, col_slice].contiguous(),
+            bits,
+            args,
+            apply_row_center=apply_unit_row_center,
+            imp_mask=unit_imp_mask,
+            activation_diag=unit_activation_diag,
+            fulls_hessian=unit_fulls_hessian,
+        )
+        if args.log_unit_interval > 0 and unit_idx % args.log_unit_interval == 0:
+            print(f"    finished {unit_idx}/{len(units)} units for {weight_name}", flush=True)
+
+    if row_mean is not None:
+        Q += row_mean
+    del daq_source, row_mean
+    return Q
+
+
+def quantize_weight_column_gptq_compensated(
+    args,
+    weight_name,
+    W,
+    Z,
+    units,
+    precision_map,
+    weight_imp_mask,
+    inverse_chol_upper,
+    activation_diag=None,
+    cov=None,
+    normalizer=None,
+):
+    if inverse_chol_upper is None:
+        raise ValueError(
+            f"{weight_name}: --gptq_compensation requires a full-SMCS inverse factor. "
+            "Use the layerwise or stagewise pipeline, not an old blockdiag Z cache."
+        )
+
+    rows, cols = W.shape
+    for _unit_key, row_slice, _col_slice in units:
+        row_start = 0 if row_slice.start is None else row_slice.start
+        row_end = rows if row_slice.stop is None else row_slice.stop
+        if row_start != 0 or row_end != rows:
+            raise ValueError(f"{weight_name}: GPTQ compensation only supports full-row column units.")
+
+    target_device = _device_or_cpu(args.gptq_compensation_device)
+    daq_args = argparse.Namespace(**vars(args))
+    daq_args.daq_device = str(target_device)
+    daq_args.daq_row_center = False
+    daq_args.daq_block_row_center = False
+
+    work_weight = W.to(target_device, dtype=torch.float32).contiguous()
+    z_device = Z.to(target_device, dtype=torch.float32).contiguous()
+    inverse_upper = inverse_chol_upper.to(target_device, dtype=torch.float32).contiguous()
+    full_imp_mask = weight_imp_mask.to(target_device) if weight_imp_mask is not None else None
+    apply_fulls_refine = should_apply_fulls_refine(args, weight_name)
+    if apply_fulls_refine:
+        if cov is None or normalizer is None:
+            raise ValueError(f"{weight_name}: --daq_fulls_refine requires covariance and normalizer.")
+        print(f"  full-S fixed-B refinement enabled inside GPTQ compensation for {weight_name}", flush=True)
+        fulls_cov = cov.to(target_device, dtype=torch.float32).contiguous()
+        fulls_normalizer = float(normalizer)
+    else:
+        fulls_cov = None
+        fulls_normalizer = None
+    Q_device = torch.empty_like(work_weight)
+
+    for unit_idx, (_unit_key, row_slice, col_slice) in enumerate(units, start=1):
+        col_start = 0 if col_slice.start is None else col_slice.start
+        col_end = cols if col_slice.stop is None else col_slice.stop
+        precision_lookup_key = precision_lookup_key_for_unit(
+            weight_name,
+            W.shape,
+            row_slice,
+            col_slice,
+            args.abmp_granularity,
+        )
+        bits = get_precision_bits(precision_map, weight_name, precision_lookup_key, args.default_bits)
+        unit_weight = work_weight[:, col_start:col_end].contiguous()
+        unit_z = z_device[:, col_start:col_end].contiguous()
+        unit_imp_mask = (
+            full_imp_mask[:, col_start:col_end].contiguous()
+            if full_imp_mask is not None
+            else None
+        )
+        unit_activation_diag = (
+            activation_diag[col_start:col_end].contiguous()
+            if activation_diag is not None
+            else None
+        )
+        unit_fulls_hessian = (
+            (fulls_cov[col_start:col_end, col_start:col_end] / fulls_normalizer).contiguous()
+            if fulls_cov is not None
+            else None
+        )
+        unit_quantized = run_daq_unit(
+            unit_weight,
+            unit_z,
+            bits,
+            daq_args,
+            apply_row_center=False,
+            imp_mask=unit_imp_mask,
+            activation_diag=unit_activation_diag,
+            fulls_hessian=unit_fulls_hessian,
+        ).to(target_device)
+        Q_device[:, col_start:col_end] = unit_quantized
+
+        if col_end < cols:
+            diagonal = torch.diagonal(
+                inverse_upper[col_start:col_end, col_start:col_end]
+            ).clamp_min(args.inverse_diag_floor)
+            error = (unit_weight - unit_quantized) / diagonal.view(1, -1)
+            work_weight[:, col_end:] -= error @ inverse_upper[col_start:col_end, col_end:]
+            del diagonal, error
+
+        if args.log_unit_interval > 0 and unit_idx % args.log_unit_interval == 0:
+            print(f"    GPTQ compensated {unit_idx}/{len(units)} units for {weight_name}", flush=True)
+        del unit_weight, unit_z, unit_imp_mask, unit_fulls_hessian, unit_quantized
+        gc.collect()
+        if target_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    Q = Q_device.detach().cpu()
+    del work_weight, z_device, inverse_upper, full_imp_mask, fulls_cov, Q_device
+    if target_device.type == "cuda":
+        torch.cuda.empty_cache()
+    return Q
+
+
+def quantize_weight_tensor(
+    args,
+    weight_name,
+    W,
+    Z,
+    precision_map,
+    cov=None,
+    normalizer=None,
+    inverse_chol_upper=None,
+    activation_diag=None,
+):
+    assert W.shape == Z.shape, (weight_name, W.shape, Z.shape)
+    if args.dor_mask_scope == "weight":
+        _, imp_lamda = resolve_daq_component_params(args)
+        weight_imp_mask = build_imp_mask(Z, imp_lamda)
+    else:
+        weight_imp_mask = None
+
+    if getattr(args, "daq_activation_diag", False):
+        if activation_diag is None:
+            if cov is None or normalizer is None:
+                raise ValueError(f"{weight_name}: --daq_activation_diag requires covariance/normalizer or activation_diag.")
+            activation_diag = (torch.diagonal(cov).to(torch.float32) / float(normalizer)).contiguous()
+        else:
+            activation_diag = activation_diag.to(torch.float32).contiguous()
+        if activation_diag.numel() != W.shape[1]:
+            raise ValueError(
+                f"{weight_name}: activation diag length {activation_diag.numel()} "
+                f"does not match in_features {W.shape[1]}."
+            )
+    else:
+        activation_diag = None
+
+    units = list(iter_quant_units(weight_name, W.shape, args.daq_granularity, args.quant_block_size))
+    bit_counts = precision_bit_counts(args, units, precision_map, weight_name, W.shape, args.default_bits)
+    print(
+        f"  DAQ {weight_name}, granularity={args.daq_granularity}, "
+        f"units={len(units)}, bits={bit_counts}, shape={tuple(W.shape)}",
+        flush=True,
+    )
+
+    inverse_info = None
+    if args.daq_granularity == "weight":
+        bits = get_precision_bits(precision_map, weight_name, weight_name, args.default_bits)
+        fulls_hessian = None
+        if should_apply_fulls_refine(args, weight_name):
+            if cov is None or normalizer is None:
+                raise ValueError(f"{weight_name}: --daq_fulls_refine requires covariance and normalizer.")
+            fulls_hessian = (cov.to(torch.float32) / float(normalizer)).contiguous()
+        Q = run_daq_unit(
+            W,
+            Z,
+            bits,
+            args,
+            imp_mask=weight_imp_mask,
+            activation_diag=activation_diag,
+            fulls_hessian=fulls_hessian,
+        )
+    elif getattr(args, "gptq_compensation", False):
+        if inverse_chol_upper is None and cov is not None:
+            _inverse_diag, inverse_chol_upper, inverse_info = compute_inverse_chol_upper_from_cov(
+                args,
+                cov,
+                normalizer,
+                weight_name,
+            )
+            del _inverse_diag
+        Q = quantize_weight_column_gptq_compensated(
+            args,
+            weight_name,
+            W,
+            Z,
+            units,
+            precision_map,
+            weight_imp_mask,
+            inverse_chol_upper,
+            activation_diag=activation_diag,
+            cov=cov,
+            normalizer=normalizer,
+        )
+    else:
+        Q = quantize_weight_independent_units(
+            args,
+            weight_name,
+            W,
+            Z,
+            units,
+            precision_map,
+            weight_imp_mask,
+            activation_diag=activation_diag,
+            cov=cov,
+            normalizer=normalizer,
+        )
+
+    assert Q.shape == W.shape
+    assert torch.isfinite(Q).all()
+    err = torch.norm(W - Q).item()
+    rel_err = (torch.norm(W - Q) / (torch.norm(W) + 1e-12)).item()
+    print(f"  error_norm={err:.6f}, rel_error={rel_err:.6f}", flush=True)
+    del units, weight_imp_mask, activation_diag
+    return Q, inverse_info
+
+
+def quantize_blocks_from_cache(
+    args,
+    weight_map,
+    block_map,
+    precision_map,
+    z_cache_dir,
+    cov_map=None,
+    normalizer_map=None,
+    inverse_chol_map=None,
+    activation_diag_map=None,
+):
     quant_dir = Path(args.output_dir) / "quantized_blocks"
     quant_dir.mkdir(parents=True, exist_ok=True)
     quantized_tensor_map = {}
     save_dtype = quant_dtype(args.save_dtype)
-    granularity = args.daq_granularity
 
     for block_idx, names in block_map.items():
         print(f"Quantizing block {block_idx}: {len(names)} weights")
@@ -507,80 +1056,19 @@ def quantize_blocks_from_cache(args, weight_map, block_map, precision_map, z_cac
             for weight_name in names:
                 W = load_weight_from_checkpoint(weight_name, weight_map, args.model_path)
                 Z = z_src.get_tensor(weight_name).to(dtype=torch.float32)
-                assert W.shape == Z.shape, (weight_name, W.shape, Z.shape)
-                if args.dor_mask_scope == "weight":
-                    _, imp_lamda = resolve_daq_component_params(args)
-                    weight_imp_mask = build_imp_mask(Z, imp_lamda)
-                else:
-                    weight_imp_mask = None
-
-                units = list(
-                    iter_quant_units(
-                        weight_name,
-                        W.shape,
-                        granularity,
-                        args.quant_block_size,
-                    )
+                Q, _ = quantize_weight_tensor(
+                    args,
+                    weight_name,
+                    W,
+                    Z,
+                    precision_map,
+                    cov=(cov_map or {}).get(weight_name),
+                    normalizer=(normalizer_map or {}).get(weight_name),
+                    inverse_chol_upper=(inverse_chol_map or {}).get(weight_name),
+                    activation_diag=(activation_diag_map or {}).get(weight_name),
                 )
-                bit_counts = precision_bit_counts(args, units, precision_map, weight_name, W.shape, args.default_bits)
-                print(
-                    f"  DAQ {weight_name}, granularity={granularity}, "
-                    f"units={len(units)}, bits={bit_counts}, shape={tuple(W.shape)}"
-                )
-
-                if granularity == "weight":
-                    bits = get_precision_bits(precision_map, weight_name, weight_name, args.default_bits)
-                    Q = run_daq_unit(W, Z, bits, args, imp_mask=weight_imp_mask)
-                else:
-                    if args.daq_row_center:
-                        row_mean = W.mean(dim=1, keepdim=True)
-                        daq_source = W - row_mean
-                    else:
-                        row_mean = None
-                        daq_source = W
-
-                    Q = torch.empty_like(W)
-                    for unit_idx, (unit_key, row_slice, col_slice) in enumerate(units, start=1):
-                        precision_lookup_key = precision_lookup_key_for_unit(
-                            weight_name,
-                            W.shape,
-                            row_slice,
-                            col_slice,
-                            args.abmp_granularity,
-                        )
-                        bits = get_precision_bits(
-                            precision_map,
-                            weight_name,
-                            precision_lookup_key,
-                            args.default_bits,
-                        )
-                        unit_imp_mask = (
-                            weight_imp_mask[row_slice, col_slice].contiguous()
-                            if weight_imp_mask is not None
-                            else None
-                        )
-                        Q[row_slice, col_slice] = run_daq_unit(
-                            daq_source[row_slice, col_slice].contiguous(),
-                            Z[row_slice, col_slice].contiguous(),
-                            bits,
-                            args,
-                            apply_row_center=False,
-                            imp_mask=unit_imp_mask,
-                        )
-                        if args.log_unit_interval > 0 and unit_idx % args.log_unit_interval == 0:
-                            print(f"    finished {unit_idx}/{len(units)} units for {weight_name}")
-
-                    if row_mean is not None:
-                        Q += row_mean
-                    del daq_source, row_mean
-
-                assert Q.shape == W.shape
-                assert torch.isfinite(Q).all()
-                err = torch.norm(W - Q).item()
-                rel_err = (torch.norm(W - Q) / (torch.norm(W) + 1e-12)).item()
-                print(f"  error_norm={err:.6f}, rel_error={rel_err:.6f}")
                 quantized_block[weight_name] = Q.to(save_dtype).contiguous()
-                del W, Z, Q, units, weight_imp_mask
+                del W, Z, Q
 
         block_file = quant_dir / f"block_{block_idx:02d}.safetensors"
         save_file(quantized_block, str(block_file), metadata={"format": "pt"})
@@ -650,6 +1138,11 @@ def rewrite_full_checkpoint(model_path, output_dir, quantized_tensor_map):
 def main():
     args = parse_args()
     validate_granularity_args(args)
+    if args.gptq_compensation:
+        raise NotImplementedError(
+            "--gptq_compensation requires full-SMCS inverse factors and is only "
+            "supported by tools/quant_layerwise_pipeline.py or tools/quant_stagewise_pipeline.py."
+        )
     effective_daq_steps, effective_imp_lamda = resolve_daq_component_params(args)
     print(
         f"DAQ component: {args.daq_component} "
@@ -657,7 +1150,11 @@ def main():
         f"effective_imp_lamda={effective_imp_lamda}, "
         f"dor_mask_scope={args.dor_mask_scope}, "
         f"daq_row_center={args.daq_row_center}, "
-        f"z_row_center={args.z_row_center})"
+        f"daq_block_row_center={args.daq_block_row_center}, "
+        f"z_row_center={args.z_row_center}, "
+        f"damping_mode={args.damping_mode}, "
+        f"damping={args.damping}, "
+        f"damp_percent={args.damp_percent})"
     )
     print(
         "MCS states: "

@@ -166,6 +166,20 @@ def inverse_diag_adaptive(
     )
 
 
+def resolve_damping_value(
+    matrix,
+    damping,
+    damping_mode="absolute",
+    damp_percent=0.01,
+):
+    if damping_mode == "absolute":
+        return float(damping)
+    if damping_mode == "diag_mean":
+        diag_mean = torch.diagonal(matrix.to(dtype=torch.float32)).mean().item()
+        return float(damp_percent) * float(diag_mean)
+    raise ValueError(f"Unsupported damping_mode: {damping_mode}")
+
+
 def get_mcs_mat(model, model_path, nsamples,
                 seed,seqlen,
                 num_steps,gamma,
@@ -175,7 +189,9 @@ def get_mcs_mat(model, model_path, nsamples,
                 max_mcs_samples=None,
                 include_full_visible=True,
                 mcs_normalization="tokens",
-                inverse_diag_floor=1e-12):
+                inverse_diag_floor=1e-12,
+                damping_mode="absolute",
+                damp_percent=0.01):
     sample_cnt = 1
 
     input_device = model.model.device
@@ -252,22 +268,30 @@ def build_imp_mat_from_mcs(
     row_center_granularity="weight",
     row_center_block_size=128,
     inverse_diag_floor=1e-12,
+    damping_mode="absolute",
+    damp_percent=0.01,
 ):
     if weight_map is None:
         weight_map = load_weight_map(model_path)
 
     S_diag = []
     for group_idx, g in enumerate(mcs_mat):
-        diag, used_damping = inverse_diag_adaptive(
+        requested_damping = resolve_damping_value(
             g,
             damping,
+            damping_mode=damping_mode,
+            damp_percent=damp_percent,
+        )
+        diag, used_damping = inverse_diag_adaptive(
+            g,
+            requested_damping,
             min_diag=inverse_diag_floor,
             context=f"{weight_name}[group={group_idx}]",
         )
-        if used_damping != float(damping):
+        if used_damping != float(requested_damping):
             print(
                 f"{weight_name}[group={group_idx}]: adaptive damping "
-                f"{float(damping):.6e} -> {used_damping:.6e}"
+                f"{float(requested_damping):.6e} -> {used_damping:.6e}"
             )
         S_diag.append(diag)
     S_diag = torch.cat(S_diag, dim=0)
@@ -320,6 +344,8 @@ def get_imp_mat(model, model_path, nsamples,
             damping,
             weight_map=weight_map,
             inverse_diag_floor=inverse_diag_floor,
+            damping_mode=damping_mode,
+            damp_percent=damp_percent,
         )
     return imp_mats
 

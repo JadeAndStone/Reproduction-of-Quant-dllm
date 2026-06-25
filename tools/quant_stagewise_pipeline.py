@@ -15,6 +15,7 @@ from main import (
     block_weight_names,
     build_imp_mask,
     build_max_memory,
+    compute_z_and_inverse_factor,
     copy_model_assets,
     get_precision_bits,
     get_target_weight_names,
@@ -23,12 +24,14 @@ from main import (
     precision_bit_counts,
     precision_lookup_key_for_unit,
     quant_dtype,
+    quantize_weight_tensor,
     resolve_daq_component_params,
     rewrite_full_checkpoint,
     run_daq_unit,
     score_group_key,
     score_to_precision,
     score_to_precision_grouped,
+    should_apply_fulls_refine,
     validate_granularity_args,
     z_block_path,
 )
@@ -147,17 +150,38 @@ def collect_stage_covs(args, model, block_idx, stage_name, names, current_cache_
 def compute_stage_z(args, stage_name, names, covs, token_counts, mcs_step_count, weight_map):
     z_tensors = {}
     reports = {}
+    inverse_chol_map = {}
+    activation_diag_map = {}
+    fulls_cov_map = {}
+    fulls_normalizer_map = {}
     for name in names:
         normalizer = token_counts[name] if args.mcs_normalization == "tokens" else mcs_step_count
         print(f"  stage {stage_name}: inverse+Z {name}, normalizer={normalizer}", flush=True)
-        z_tensor, inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
+        if getattr(args, "daq_activation_diag", False):
+            activation_diag_map[name] = (
+                torch.diagonal(covs[name]).detach().cpu().to(torch.float32) / float(normalizer)
+            ).contiguous()
+        if should_apply_fulls_refine(args, name):
+            fulls_cov_map[name] = covs[name].detach().cpu().to(torch.float32).contiguous()
+            fulls_normalizer_map[name] = int(normalizer)
+        if args.gptq_compensation:
+            z_tensor, inverse_info, inverse_chol_upper = compute_z_and_inverse_factor(
+                args,
+                name,
+                covs[name],
+                normalizer,
+                weight_map,
+            )
+            inverse_chol_map[name] = inverse_chol_upper
+        else:
+            z_tensor, inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
         z_tensors[name] = z_tensor
         reports[name] = inverse_info
         del covs[name]
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    return z_tensors, reports
+    return z_tensors, reports, inverse_chol_map, activation_diag_map, fulls_cov_map, fulls_normalizer_map
 
 
 def precision_from_z_tensors(args, z_tensors):
@@ -183,68 +207,37 @@ def precision_from_z_tensors(args, z_tensors):
     return score_to_precision_grouped(scores, score_groups, args.allocate_ratio), scores
 
 
-def quantize_stage_tensors(args, weight_map, z_tensors, precision_map, out_file):
+def quantize_stage_tensors(
+    args,
+    weight_map,
+    z_tensors,
+    precision_map,
+    out_file,
+    cov_map=None,
+    normalizer_map=None,
+    inverse_chol_map=None,
+    activation_diag_map=None,
+):
     quantized = {}
     tensor_map = {}
     save_dtype = quant_dtype(args.save_dtype)
-    granularity = args.daq_granularity
     for weight_name, z_tensor in z_tensors.items():
         W = load_weight_from_checkpoint(weight_name, weight_map, args.model_path)
         Z = z_tensor.to(dtype=torch.float32)
-        if args.dor_mask_scope == "weight":
-            _, imp_lamda = resolve_daq_component_params(args)
-            weight_imp_mask = build_imp_mask(Z, imp_lamda)
-        else:
-            weight_imp_mask = None
-
-        units = list(iter_quant_units(weight_name, W.shape, granularity, args.quant_block_size))
-        bit_counts = precision_bit_counts(args, units, precision_map, weight_name, W.shape, args.default_bits)
-        print(
-            f"  stage DAQ {weight_name}, granularity={granularity}, "
-            f"units={len(units)}, bits={bit_counts}, shape={tuple(W.shape)}",
-            flush=True,
+        Q, _ = quantize_weight_tensor(
+            args,
+            weight_name,
+            W,
+            Z,
+            precision_map,
+            cov=(cov_map or {}).get(weight_name),
+            normalizer=(normalizer_map or {}).get(weight_name),
+            inverse_chol_upper=(inverse_chol_map or {}).get(weight_name),
+            activation_diag=(activation_diag_map or {}).get(weight_name),
         )
-        if granularity == "weight":
-            bits = get_precision_bits(precision_map, weight_name, weight_name, args.default_bits)
-            Q = run_daq_unit(W, Z, bits, args, imp_mask=weight_imp_mask)
-        else:
-            if args.daq_row_center:
-                row_mean = W.mean(dim=1, keepdim=True)
-                daq_source = W - row_mean
-            else:
-                row_mean = None
-                daq_source = W
-            Q = torch.empty_like(W)
-            for unit_idx, (unit_key, row_slice, col_slice) in enumerate(units, start=1):
-                precision_key = precision_lookup_key_for_unit(
-                    weight_name,
-                    W.shape,
-                    row_slice,
-                    col_slice,
-                    args.abmp_granularity,
-                )
-                bits = get_precision_bits(precision_map, weight_name, precision_key, args.default_bits)
-                unit_imp_mask = weight_imp_mask[row_slice, col_slice].contiguous() if weight_imp_mask is not None else None
-                Q[row_slice, col_slice] = run_daq_unit(
-                    daq_source[row_slice, col_slice].contiguous(),
-                    Z[row_slice, col_slice].contiguous(),
-                    bits,
-                    args,
-                    apply_row_center=False,
-                    imp_mask=unit_imp_mask,
-                )
-                if args.log_unit_interval > 0 and unit_idx % args.log_unit_interval == 0:
-                    print(f"    finished {unit_idx}/{len(units)} units for {weight_name}", flush=True)
-            if row_mean is not None:
-                Q += row_mean
-            del daq_source, row_mean
-
-        err = torch.norm(W - Q).item()
-        rel = (torch.norm(W - Q) / (torch.norm(W) + 1e-12)).item()
-        print(f"  stage error_norm={err:.6f}, rel_error={rel:.6f}", flush=True)
         quantized[weight_name] = Q.to(save_dtype).contiguous()
         tensor_map[weight_name] = str(out_file)
-        del W, Z, Q, units, weight_imp_mask
+        del W, Z, Q
         gc.collect()
     save_file(quantized, str(out_file), metadata={"format": "pt"})
     return quantized, tensor_map
@@ -275,10 +268,35 @@ def stagewise_quantize_block(args, model, block_idx, block_names, current_cache,
     for stage_name, suffixes in STAGES:
         names = names_for_stage(block_names, suffixes)
         covs, token_counts = collect_stage_covs(args, model, block_idx, stage_name, names, current_cache)
-        z_tensors, reports = compute_stage_z(args, stage_name, names, covs, token_counts, mcs_step_count, weight_map)
+        (
+            z_tensors,
+            reports,
+            inverse_chol_map,
+            activation_diag_map,
+            fulls_cov_map,
+            fulls_normalizer_map,
+        ) = compute_stage_z(
+            args,
+            stage_name,
+            names,
+            covs,
+            token_counts,
+            mcs_step_count,
+            weight_map,
+        )
         precision_map, scores = precision_from_z_tensors(args, z_tensors)
         out_file = quant_dir / f"block_{block_idx:02d}_{stage_name}.safetensors"
-        quantized, tensor_map = quantize_stage_tensors(args, weight_map, z_tensors, precision_map, out_file)
+        quantized, tensor_map = quantize_stage_tensors(
+            args,
+            weight_map,
+            z_tensors,
+            precision_map,
+            out_file,
+            cov_map=fulls_cov_map,
+            normalizer_map=fulls_normalizer_map,
+            inverse_chol_map=inverse_chol_map,
+            activation_diag_map=activation_diag_map,
+        )
         apply_quantized_in_memory(model, quantized)
 
         block_z_tensors.update({name: tensor.to(quant_dtype(args.z_save_dtype)).contiguous() for name, tensor in z_tensors.items()})
@@ -286,7 +304,7 @@ def stagewise_quantize_block(args, model, block_idx, block_names, current_cache,
         block_precision_map.update(precision_map)
         block_scores.update(scores)
         block_tensor_map.update(tensor_map)
-        del covs, token_counts, z_tensors, quantized
+        del covs, token_counts, z_tensors, quantized, inverse_chol_map, activation_diag_map, fulls_cov_map, fulls_normalizer_map
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

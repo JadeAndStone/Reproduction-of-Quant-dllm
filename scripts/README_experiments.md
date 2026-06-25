@@ -172,3 +172,33 @@ Notes:
 - `mcs_no_full_visible`, `nsamples=128`, `seqlen=4096`, and `num_steps=20` are the default paper-aligned calibration settings used by these scripts.
 - On local 16GB V100s, `GPU_MEMORY=13GiB` is more stable during `device_map=auto` model loading than `15GiB`.
 - `EVAL_LIMIT` is for smoke tests only and should not be compared directly with full benchmark results.
+
+## 6. Current GPTQ-compensated DAQ mainline
+
+The strongest paper-faithful reproduction line currently uses stage-wise statistics, column-group ABMP/DAQ, DOR, and GPTQ/OBC-style compensation. The detailed formulas and implementation mapping are in `docs/stagewise_gptq_daq_quantization.md`.
+
+Launch the full WinoGrande reproduction run:
+
+```bash
+cd /root/data-fs/Quant-dllm
+
+RUN_ID=stagewise_gptq_comp_colabmp_n128_s4096_t20_tok0_diag1p_$(date +%Y%m%d_%H%M%S) \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+PYTHON_BIN=/root/miniconda3/envs/qdlm/bin/python \
+C4_SOURCE=/root/data-fs/c4-train/c4-train.00000-of-01024.json.gz \
+MAX_TOKENS_PER_STATE=0 \
+DAMPING=0.0 \
+DAMPING_MODE=diag_mean \
+DAMP_PERCENT=0.01 \
+DAQ_GRANULARITY=column \
+ABMP_GRANULARITY=column \
+ABMP_RANK_SCOPE=weight \
+GPTQ_COMPENSATION=1 \
+DAQ_FULLS_REFINE=0 \
+RUN_EVAL=1 \
+EVAL_TASKS=winogrande \
+EVAL_LIMIT=full \
+bash scripts/local_stagewise_quant_eval.sh
+```
+
+Use `EVAL_LIMIT=200` only for smoke testing.

@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from MCS import load_dataset as mcs
 from main import build_max_memory, get_target_weight_names, block_weight_names
 from tools.diagnose_full_smcs import register_full_smcs_hooks, inverse_diag
-from utils.generate_imp_mat import load_weight_map, load_weight_from_checkpoint
+from utils.generate_imp_mat import load_weight_map, load_weight_from_checkpoint, resolve_damping_value
 
 
 def parse_args():
@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument('--max-tokens-per-state', type=int, default=128)
     parser.add_argument('--mcs_no_full_visible', action='store_true')
     parser.add_argument('--damping', type=float, default=0.01)
+    parser.add_argument('--damping-mode', choices=['absolute', 'diag_mean'], default='absolute')
+    parser.add_argument('--damp-percent', type=float, default=0.01)
     parser.add_argument('--mcs-normalization', choices=['tokens', 'mcs_steps'], default='tokens')
     parser.add_argument('--inverse-diag-floor', type=float, default=1e-12)
     parser.add_argument('--inverse-device', default='cuda:0')
@@ -91,19 +93,28 @@ def block_ready(path, names):
 
 def compute_z_for_weight(args, weight_name, cov, normalizer, weight_map):
     cov = cov / float(normalizer)
-    diag, inverse_info = inverse_diag(
+    requested_damping = resolve_damping_value(
         cov,
         args.damping,
+        damping_mode=args.damping_mode,
+        damp_percent=args.damp_percent,
+    )
+    diag, inverse_info = inverse_diag(
+        cov,
+        requested_damping,
         args.inverse_device,
         min_diag=args.inverse_diag_floor,
         context=weight_name,
         return_info=True,
     )
+    inverse_info['requested_damping'] = float(requested_damping)
+    inverse_info['damping_mode'] = args.damping_mode
+    inverse_info['damp_percent'] = args.damp_percent
     used_damping = inverse_info['used_damping']
-    if used_damping != float(args.damping):
+    if used_damping != float(requested_damping):
         print(
             f'  {weight_name}: adaptive damping '
-            f'{float(args.damping):.6e} -> {used_damping:.6e}',
+            f'{float(requested_damping):.6e} -> {used_damping:.6e}',
             flush=True,
         )
     scale = 1.0 / diag.clamp_min(args.inverse_diag_floor)
@@ -141,6 +152,8 @@ def main():
         'max_tokens_per_state': args.max_tokens_per_state,
         'mcs_no_full_visible': args.mcs_no_full_visible,
         'damping': args.damping,
+        'damping_mode': args.damping_mode,
+        'damp_percent': args.damp_percent,
         'inverse_diag_floor': args.inverse_diag_floor,
         'mcs_step_count': mcs_step_count,
         'mcs_normalization': args.mcs_normalization,
@@ -195,7 +208,7 @@ def main():
             normalizer = token_counts[name] if args.mcs_normalization == 'tokens' else mcs_step_count
             print(f'  block {block_idx}: normalizer={normalizer}', flush=True)
             tensors[name], inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
-            if inverse_info['used_damping'] != float(args.damping):
+            if inverse_info['used_damping'] != float(inverse_info['requested_damping']):
                 print(
                     f'  block {block_idx}: {name} used_damping={inverse_info["used_damping"]:.6e}',
                     flush=True,

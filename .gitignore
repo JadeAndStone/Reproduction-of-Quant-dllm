@@ -57,3 +57,13 @@ Thumbs.db
 
 # One-off local debug scripts
 debug_*.py
+
+# Local diagnostics and extracted paper text
+diagnostics/
+paper_texts/
+tools/diagnose_*.py
+tools/analyze_wino_margins.py
+scripts/*diag*.sh
+scripts/run_stagewise_gptq_fulls_wino200.sh
+scripts/local_diagmean_grouped_quant_eval.sh
+scripts/local_stagewise_diagaware_quant_eval.sh

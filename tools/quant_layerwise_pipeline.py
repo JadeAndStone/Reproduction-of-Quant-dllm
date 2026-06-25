@@ -23,6 +23,7 @@ from main import (
     build_max_memory,
     compute_abmp_scores_from_cache,
     compute_unit_abmp_scores_from_cache,
+    compute_z_and_inverse_factor,
     copy_model_assets,
     get_target_weight_names,
     infer_num_layers,
@@ -30,6 +31,7 @@ from main import (
     quantize_blocks_from_cache,
     rewrite_full_checkpoint,
     score_to_precision,
+    should_apply_fulls_refine,
     score_to_precision_grouped,
     validate_granularity_args,
     z_block_path,
@@ -64,6 +66,8 @@ def parse_args():
 
     parser.add_argument("--allocate_ratio", type=float, default=0.05)
     parser.add_argument("--damping", type=float, default=0.01)
+    parser.add_argument("--damping_mode", choices=["absolute", "diag_mean"], default="absolute")
+    parser.add_argument("--damp_percent", type=float, default=0.01)
     parser.add_argument("--inverse_diag_floor", type=float, default=1e-12)
     parser.add_argument("--inverse_device", default="cuda:0")
     parser.add_argument("--daq_steps", type=int, default=10)
@@ -71,6 +75,7 @@ def parse_args():
     parser.add_argument("--dor_mask_scope", choices=["unit", "weight"], default="unit")
     parser.add_argument("--daq_component", choices=["custom", "baseline", "rsr_no_dor", "rsr_w_dor"], default="rsr_w_dor")
     parser.add_argument("--daq_row_center", action="store_true")
+    parser.add_argument("--daq_block_row_center", action="store_true")
     parser.add_argument("--z_row_center", action="store_true")
     parser.add_argument("--skip_abmp", action="store_true")
     parser.add_argument("--default_bits", type=int, default=2)
@@ -81,6 +86,40 @@ def parse_args():
     parser.add_argument("--abmp_rank_scope", choices=["global", "transformer_block", "weight"], default="weight")
     parser.add_argument("--quant_block_size", type=int, default=128)
     parser.add_argument("--daq_device", default="cpu")
+    parser.add_argument(
+        "--daq_activation_diag",
+        action="store_true",
+        help=(
+            "Diagnostic experiment: include activation covariance diagonal in DAQ "
+            "alpha updates, minimizing diag(X^T X)-weighted weight error inside each unit."
+        ),
+    )
+    parser.add_argument(
+        "--daq_activation_diag_mode",
+        choices=["activation", "dor_activation"],
+        default="dor_activation",
+        help="Solve weight for --daq_activation_diag: diag only or DOR mask squared times diag.",
+    )
+    parser.add_argument(
+        "--gptq_compensation",
+        action="store_true",
+        help=(
+            "Apply GPTQ/OBC-style block-wise compensation. Requires full SMCS "
+            "covariances collected by this pipeline."
+        ),
+    )
+    parser.add_argument("--gptq_compensation_device", default="cuda:0")
+    parser.add_argument(
+        "--daq_fulls_refine",
+        action="store_true",
+        help="Apply fixed-B full-S scale refinement after DAQ for selected Linear weights.",
+    )
+    parser.add_argument("--daq_fulls_device", default="cuda:0")
+    parser.add_argument("--daq_fulls_steps", type=int, default=3)
+    parser.add_argument("--daq_fulls_ridge", type=float, default=1e-5)
+    parser.add_argument("--daq_fulls_target_modules", default="ff_proj,up_proj,ff_out")
+    parser.add_argument("--daq_fulls_start_block", type=int, default=0)
+    parser.add_argument("--daq_fulls_end_block", type=int, default=None)
     parser.add_argument("--log_unit_interval", type=int, default=0)
 
     parser.add_argument("--start_block", type=int, default=0)
@@ -261,10 +300,31 @@ def save_block_z(args, block_idx, names, covs, token_counts, mcs_step_count, wei
     z_cache_dir.mkdir(parents=True, exist_ok=True)
     tensors = {}
     reports = {}
+    inverse_chol_map = {}
+    activation_diag_map = {}
+    fulls_cov_map = {}
+    fulls_normalizer_map = {}
     for name in names:
         normalizer = token_counts[name] if args.mcs_normalization == "tokens" else mcs_step_count
         print(f"  block {block_idx}: inverse+Z {name}, normalizer={normalizer}", flush=True)
-        z_tensor, inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
+        if getattr(args, "daq_activation_diag", False):
+            activation_diag_map[name] = (
+                torch.diagonal(covs[name]).detach().cpu().to(torch.float32) / float(normalizer)
+            ).contiguous()
+        if should_apply_fulls_refine(args, name):
+            fulls_cov_map[name] = covs[name].detach().cpu().to(torch.float32).contiguous()
+            fulls_normalizer_map[name] = int(normalizer)
+        if args.gptq_compensation:
+            z_tensor, inverse_info, inverse_chol_upper = compute_z_and_inverse_factor(
+                args,
+                name,
+                covs[name],
+                normalizer,
+                weight_map,
+            )
+            inverse_chol_map[name] = inverse_chol_upper
+        else:
+            z_tensor, inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
         tensors[name] = z_tensor.to(quant_dtype(args.z_save_dtype)).contiguous()
         reports[name] = inverse_info
         del z_tensor, covs[name]
@@ -278,7 +338,7 @@ def save_block_z(args, block_idx, names, covs, token_counts, mcs_step_count, wei
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return out_path
+    return out_path, inverse_chol_map, activation_diag_map, fulls_cov_map, fulls_normalizer_map
 
 
 def precision_for_block(args, block_idx, names, z_cache_dir):
@@ -395,7 +455,22 @@ def main():
         names = block_map[block_idx]
         print(f"===== Layer-wise block {block_idx} ({pos + 1}/{len(selected_blocks)}) =====", flush=True)
         covs, token_counts = collect_block_covs(args, model, block_idx, names, current_cache)
-        z_path = save_block_z(args, block_idx, names, covs, token_counts, mcs_step_count, weight_map, z_cache_dir)
+        (
+            z_path,
+            block_inverse_chol_map,
+            block_activation_diag_map,
+            block_fulls_cov_map,
+            block_fulls_normalizer_map,
+        ) = save_block_z(
+            args,
+            block_idx,
+            names,
+            covs,
+            token_counts,
+            mcs_step_count,
+            weight_map,
+            z_cache_dir,
+        )
         print(f"Block {block_idx}: saved Z to {z_path}", flush=True)
         del covs, token_counts
         gc.collect()
@@ -417,10 +492,19 @@ def main():
                 {block_idx: names},
                 block_precision_map,
                 z_cache_dir,
+                cov_map=block_fulls_cov_map,
+                normalizer_map=block_fulls_normalizer_map,
+                inverse_chol_map=block_inverse_chol_map,
+                activation_diag_map=block_activation_diag_map,
             )
             quantized_tensor_map.update(block_quantized_map)
             save_json(quantized_tensor_map, output_dir / "quantized_tensor_map.json")
             apply_quantized_tensors(model, block_quantized_map)
+
+        del block_inverse_chol_map, block_activation_diag_map, block_fulls_cov_map, block_fulls_normalizer_map
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         is_last = pos == len(selected_blocks) - 1
         if not is_last:
