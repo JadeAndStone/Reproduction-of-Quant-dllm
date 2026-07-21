@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-MASK_TOKEN = "<|mdm_mask|>"
+MASK_TOKEN_CANDIDATES = ("<|mdm_mask|>", "<|mask|>", "[MASK]", "<mask>")
 
 def build_tokenizer(model_path, local_files_only=False):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -18,9 +18,17 @@ def build_tokenizer(model_path, local_files_only=False):
         trust_remote_code=True,
         local_files_only=local_files_only,
     )
-    mask_token_id = tokenizer.convert_tokens_to_ids(MASK_TOKEN)
+    mask_token_id = tokenizer.mask_token_id
     if mask_token_id is None:
-        raise ValueError(f"Mask token {MASK_TOKEN!r} is not in tokenizer vocab.")
+        for token in MASK_TOKEN_CANDIDATES:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id != tokenizer.unk_token_id:
+                mask_token_id = token_id
+                break
+    if mask_token_id is None:
+        raise ValueError(
+            f"No diffusion mask token found; tried tokenizer.mask_token_id and {MASK_TOKEN_CANDIDATES}."
+        )
     return tokenizer, mask_token_id
 
 

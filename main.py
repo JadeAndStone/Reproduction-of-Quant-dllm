@@ -20,9 +20,13 @@ from utils.generate_imp_mat import (
     resolve_damping_value,
 )
 
+REPO_ROOT = Path(__file__).resolve().parent
 MODEL_PATH = "/root/data-fs/.cache/hub/models--GSAI-ML--LLaDA-8B-Base/snapshots/LLaDA-8B-Base"
 C4_TRAIN_URL = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
-TARGET_SUFFIXES = (
+LLADA_BLOCK_PREFIX = "model.transformer.blocks"
+DREAM_BLOCK_PREFIX = "model.layers"
+
+LLADA_TARGET_SUFFIXES = (
     "q_proj.weight",
     "k_proj.weight",
     "v_proj.weight",
@@ -31,12 +35,22 @@ TARGET_SUFFIXES = (
     "up_proj.weight",
     "ff_out.weight",
 )
+DREAM_TARGET_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+)
+TARGET_SUFFIXES = LLADA_TARGET_SUFFIXES + DREAM_TARGET_SUFFIXES
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default=MODEL_PATH)
-    parser.add_argument("--output_dir", default="/root/data-fs/Quant-dllm/outputs/llada_daq_fake_quant")
+    parser.add_argument("--output_dir", default=str(REPO_ROOT / "outputs/llada_daq_fake_quant"))
     parser.add_argument("--source", default=C4_TRAIN_URL, help="C4 .json.gz URL or local path.")
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -152,19 +166,24 @@ def save_json(obj, path):
 def get_target_weight_names(weight_map):
     names = []
     for name in weight_map:
-        if not name.startswith("model.transformer.blocks."):
+        if not (
+            name.startswith(f"{LLADA_BLOCK_PREFIX}.")
+            or name.startswith(f"{DREAM_BLOCK_PREFIX}.")
+        ):
             continue
         if any(name.endswith(suffix) for suffix in TARGET_SUFFIXES):
             names.append(name)
-    suffix_order = {suffix: idx for idx, suffix in enumerate(TARGET_SUFFIXES)}
-
     def sort_key(name):
-        parts = name.split(".")
-        block_idx = int(parts[3])
+        block_idx = block_idx_from_weight_name(name)
+        if block_idx is None:
+            raise ValueError(f"Cannot infer transformer block from {name}")
+        suffixes = (
+            DREAM_TARGET_SUFFIXES
+            if name.startswith(f"{DREAM_BLOCK_PREFIX}.")
+            else LLADA_TARGET_SUFFIXES
+        )
         suffix_idx = next(
-            suffix_order[suffix]
-            for suffix in TARGET_SUFFIXES
-            if name.endswith(suffix)
+            idx for idx, suffix in enumerate(suffixes) if name.endswith(suffix)
         )
         return block_idx, suffix_idx
 
@@ -172,17 +191,20 @@ def get_target_weight_names(weight_map):
 
 
 def infer_num_layers(target_weight_names):
-    block_ids = []
-    for name in target_weight_names:
-        parts = name.split(".")
-        if len(parts) > 3 and parts[:3] == ["model", "transformer", "blocks"]:
-            block_ids.append(int(parts[3]))
+    block_ids = [
+        block_idx
+        for name in target_weight_names
+        if (block_idx := block_idx_from_weight_name(name)) is not None
+    ]
     return max(block_ids) + 1 if block_ids else 0
 
 
 def block_weight_names(target_weight_names, block_idx):
-    prefix = f"model.transformer.blocks.{block_idx}."
-    return [name for name in target_weight_names if name.startswith(prefix)]
+    return [
+        name
+        for name in target_weight_names
+        if block_idx_from_weight_name(name) == block_idx
+    ]
 
 
 def selected_block_range(args, target_weight_names):
@@ -252,6 +274,8 @@ def transformer_block_key(weight_name):
     parts = weight_name.split(".")
     if len(parts) >= 4 and parts[:3] == ["model", "transformer", "blocks"]:
         return ".".join(parts[:4])
+    if len(parts) >= 3 and parts[:2] == ["model", "layers"]:
+        return ".".join(parts[:3])
     return "__unknown_transformer_block__"
 
 
@@ -366,7 +390,16 @@ def resolve_z_cache_dir(args):
 
 def build_max_memory(args):
     if torch.cuda.is_available():
-        max_memory = {gpu_idx: args.gpu_memory for gpu_idx in range(torch.cuda.device_count())}
+        device_count = torch.cuda.device_count()
+        gpu_memory_values = [item.strip() for item in str(args.gpu_memory).split(",") if item.strip()]
+        if len(gpu_memory_values) == 1:
+            gpu_memory_values *= device_count
+        elif len(gpu_memory_values) != device_count:
+            raise ValueError(
+                f"gpu_memory must be one value or {device_count} comma-separated values, "
+                f"got {args.gpu_memory!r}."
+            )
+        max_memory = {gpu_idx: gpu_memory_values[gpu_idx] for gpu_idx in range(device_count)}
         max_memory["cpu"] = args.cpu_memory
         return max_memory
     return {"cpu": args.cpu_memory}
@@ -514,6 +547,8 @@ def block_idx_from_weight_name(weight_name):
     parts = weight_name.split(".")
     if len(parts) >= 4 and parts[:3] == ["model", "transformer", "blocks"]:
         return int(parts[3])
+    if len(parts) >= 3 and parts[:2] == ["model", "layers"]:
+        return int(parts[2])
     return None
 
 
@@ -645,7 +680,8 @@ def compute_inverse_chol_upper_from_cov(args, cov, normalizer, context):
         raise FloatingPointError(f"{context}: covariance contains non-finite values.")
 
     work = 0.5 * (work + work.T)
-    eye = torch.eye(work.shape[0], dtype=torch.float32, device=device)
+    work_diag = torch.diagonal(work)
+    base_diag = work_diag.detach().clone()
     requested_damping = resolve_damping_value(
         work,
         args.damping,
@@ -658,9 +694,13 @@ def compute_inverse_chol_upper_from_cov(args, cov, normalizer, context):
     current_damping = float(requested_damping)
     last_error = None
     for attempt in range(9):
+        chol = None
+        inverse = None
+        inverse_diag = None
+        inverse_chol_upper = None
         try:
-            damped = work + current_damping * eye
-            chol = torch.linalg.cholesky(damped)
+            work_diag.copy_(base_diag).add_(current_damping)
+            chol = torch.linalg.cholesky(work)
             inverse = torch.cholesky_inverse(chol)
             inverse = 0.5 * (inverse + inverse.T)
             inverse_diag = torch.diagonal(inverse)
@@ -676,7 +716,7 @@ def compute_inverse_chol_upper_from_cov(args, cov, normalizer, context):
                     "diag_min": float(inverse_diag.min().item()),
                     "diag_max": float(inverse_diag.max().item()),
                     "diag_mean": float(inverse_diag.mean().item()),
-                    "cov_diag_mean": float(torch.diagonal(work).mean().item()),
+                    "cov_diag_mean": float(base_diag.mean().item()),
                 }
                 if float(current_damping) != float(requested_damping):
                     print(
@@ -697,9 +737,8 @@ def compute_inverse_chol_upper_from_cov(args, cov, normalizer, context):
         except RuntimeError as exc:
             last_error = str(exc)
         finally:
-            for var_name in ("damped", "chol", "inverse", "inverse_diag", "inverse_chol_upper"):
-                if var_name in locals():
-                    del locals()[var_name]
+            del chol, inverse, inverse_diag, inverse_chol_upper
+            gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 

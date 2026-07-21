@@ -36,7 +36,7 @@ The verified mainline configuration is:
 | Row centering | disabled for `W` and `Z` |
 | Save dtype | `fp16` model weights, `fp32` Z cache |
 
-The corresponding launcher is `scripts/local_stagewise_quant_eval.sh`; pass the above values through environment variables, especially `GPTQ_COMPENSATION=1`, `DAQ_GRANULARITY=column`, `ABMP_GRANULARITY=column`, `ABMP_RANK_SCOPE=weight`, `MAX_TOKENS_PER_STATE=0`, `DAMPING_MODE=diag_mean`, and `DAMP_PERCENT=0.01`.
+The corresponding launcher is `scripts/run_quantization.sh`; pass the above values through environment variables, especially `GPTQ_COMPENSATION=1`, `DAQ_GRANULARITY=column`, `ABMP_GRANULARITY=column`, `ABMP_RANK_SCOPE=weight`, `MAX_TOKENS_PER_STATE=0`, `DAMPING_MODE=diag_mean`, and `DAMP_PERCENT=0.01`.
 
 ## 2. Tensor Shapes and Objective
 
@@ -241,7 +241,7 @@ The code also contains diagnostic variants. They are intentionally not part of t
 A local run can be launched through the maintained wrapper:
 
 ```bash
-cd /root/data-fs/Quant-dllm
+cd /root/data-fs/Quant-dllm-repro
 
 RUN_ID=stagewise_gptq_comp_colabmp_n128_s4096_t20_tok0_diag1p_$(date +%Y%m%d_%H%M%S) \
 CUDA_VISIBLE_DEVICES=0,1,2 \
@@ -273,7 +273,7 @@ DAQ_FULLS_REFINE=0 \
 RUN_EVAL=1 \
 EVAL_TASKS=winogrande \
 EVAL_LIMIT=full \
-bash scripts/local_stagewise_quant_eval.sh
+bash scripts/run_quantization.sh
 ```
 
 `EVAL_LIMIT=full` runs the full benchmark. Use `EVAL_LIMIT=200` only for smoke tests and do not compare it directly against paper tables.

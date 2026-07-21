@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 export HF_DATASETS_TRUST_REMOTE_CODE=true
 export HF_ALLOW_CODE_EVAL=1
 export HF_HOME="${HF_HOME:-/root/data-fs/hf_shared}"
@@ -20,15 +22,19 @@ QDLM_ROOT="${QDLM_ROOT:-/root/data-fs/QDLM}"
 HARNESS_DIR="${HARNESS_DIR:-$QDLM_ROOT/lm-evaluation-harness}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-MODEL_PATH="${MODEL_PATH:-/root/data-fs/Quant-dllm/outputs/llada_daq_fake_quant}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a local LLaDA model or quantized checkpoint.}"
 RUN_ID="${RUN_ID:-$(basename "$MODEL_PATH" | tr -cs '[:alnum:]_.-' '_')}"
-OUTPUT_DIR="${OUTPUT_DIR:-/root/data-fs/Quant-dllm/benchmark_results/$RUN_ID}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/benchmark_results/$RUN_ID}"
 
 MC_NUM="${MC_NUM:-128}"
 LL_BATCH_SIZE="${LL_BATCH_SIZE:-1}"
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-1}"
 MMLU_MC_NUM="${MMLU_MC_NUM:-$MC_NUM}"
 DTYPE="${DTYPE:-float16}"
+CFG_MC="${CFG_MC:-0.5}"
+CFG_MMLU="${CFG_MMLU:-0.0}"
+CFG_WINOGRANDE="${CFG_WINOGRANDE:-0.0}"
+CFG_GENERATION="${CFG_GENERATION:-0.0}"
 
 USE_OFFLOAD="${USE_OFFLOAD:-1}"
 MAX_MEMORY_PER_GPU="${MAX_MEMORY_PER_GPU:-12GB}"
@@ -54,7 +60,8 @@ build_model_args() {
   local steps="$2"
   local gen_length="$3"
   local block_length="$4"
-  local args="model_path=$MODEL_PATH,dtype=$DTYPE,mc_num=$mc_num,is_check_greedy=False,steps=$steps,gen_length=$gen_length,block_length=$block_length"
+  local cfg="$5"
+  local args="model_path=$MODEL_PATH,dtype=$DTYPE,mc_num=$mc_num,is_check_greedy=False,cfg=$cfg,steps=$steps,gen_length=$gen_length,block_length=$block_length"
   if [ "$USE_OFFLOAD" = "1" ]; then
     args="$args,device_map=auto,max_memory_per_gpu=$MAX_MEMORY_PER_GPU,max_cpu_memory=$MAX_CPU_MEMORY,offload_folder=$OFFLOAD_FOLDER"
   fi
@@ -71,6 +78,10 @@ TASK_GROUP=$TASK_GROUP
 TASKS=${TASKS:-<from group>}
 MC_NUM=$MC_NUM
 MMLU_MC_NUM=$MMLU_MC_NUM
+CFG_MC=$CFG_MC
+CFG_MMLU=$CFG_MMLU
+CFG_WINOGRANDE=$CFG_WINOGRANDE
+CFG_GENERATION=$CFG_GENERATION
 DTYPE=$DTYPE
 USE_OFFLOAD=$USE_OFFLOAD
 OFFLOAD_FOLDER=$OFFLOAD_FOLDER
@@ -117,8 +128,9 @@ run_lm_eval() {
   local gen_length="$6"
   local block_length="$7"
   local output_name="$8"
+  local cfg="${9:-$CFG_GENERATION}"
   local model_args
-  model_args="$(build_model_args "$mc_num" "$steps" "$gen_length" "$block_length")"
+  model_args="$(build_model_args "$mc_num" "$steps" "$gen_length" "$block_length" "$cfg")"
 
   local cmd=(
     "$PYTHON_BIN" -m lm_eval
@@ -161,37 +173,37 @@ run_task() {
 
   case "$task" in
     piqa)
-      run_lm_eval piqa 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 piqa
+      run_lm_eval piqa 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 piqa "$CFG_MC"
       ;;
     arc_easy)
-      run_lm_eval arc_easy 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 arc_easy
+      run_lm_eval arc_easy 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 arc_easy "$CFG_MC"
       ;;
     arc_challenge)
-      run_lm_eval arc_challenge 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 arc_challenge
+      run_lm_eval arc_challenge 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 arc_challenge "$CFG_MC"
       ;;
     hellaswag)
-      run_lm_eval hellaswag 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 hellaswag
+      run_lm_eval hellaswag 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 hellaswag "$CFG_MC"
       ;;
     mmlu)
-      run_lm_eval mmlu 5 "$MMLU_MC_NUM" "$LL_BATCH_SIZE" 256 256 32 mmlu_5shot
+      run_lm_eval mmlu 5 "$MMLU_MC_NUM" "$LL_BATCH_SIZE" 256 256 32 mmlu_5shot "$CFG_MMLU"
       ;;
     winogrande)
-      run_lm_eval winogrande 5 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 winogrande_5shot
+      run_lm_eval winogrande 5 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 winogrande_5shot "$CFG_WINOGRANDE"
       ;;
     bbh|bbh_zeroshot)
-      run_lm_eval bbh_zeroshot 0 "$MC_NUM" "$LL_BATCH_SIZE" 256 256 32 bbh_zeroshot
+      run_lm_eval bbh_zeroshot 0 "$MC_NUM" "$LL_BATCH_SIZE" 128 128 128 bbh_zeroshot "$CFG_GENERATION"
       ;;
     gsm8k)
-      run_lm_eval gsm8k 4 "$MC_NUM" "$GEN_BATCH_SIZE" 256 256 32 gsm8k
+      run_lm_eval gsm8k 4 "$MC_NUM" "$GEN_BATCH_SIZE" 256 256 32 gsm8k "$CFG_GENERATION"
       ;;
     minerva_math)
-      run_lm_eval minerva_math 0 "$MC_NUM" "$GEN_BATCH_SIZE" 256 256 64 minerva_math
+      run_lm_eval minerva_math 0 "$MC_NUM" "$GEN_BATCH_SIZE" 256 256 64 minerva_math "$CFG_GENERATION"
       ;;
     humaneval)
-      run_lm_eval humaneval 0 "$MC_NUM" "$GEN_BATCH_SIZE" 512 512 32 humaneval
+      run_lm_eval humaneval 0 "$MC_NUM" "$GEN_BATCH_SIZE" 128 128 128 humaneval "$CFG_GENERATION"
       ;;
     mbpp)
-      run_lm_eval mbpp 3 "$MC_NUM" "$GEN_BATCH_SIZE" 512 512 32 mbpp
+      run_lm_eval mbpp 3 "$MC_NUM" "$GEN_BATCH_SIZE" 128 128 128 mbpp "$CFG_GENERATION"
       ;;
     *)
       echo "Unknown task: $task" >&2

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import gc
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -21,7 +22,6 @@ from main import (
     get_target_weight_names,
     infer_num_layers,
     iter_quant_units,
-    precision_bit_counts,
     precision_lookup_key_for_unit,
     quant_dtype,
     quantize_weight_tensor,
@@ -35,9 +35,7 @@ from main import (
     validate_granularity_args,
     z_block_path,
 )
-from tools.build_full_smcs_z_cache import compute_z_for_weight
-from tools.diagnose_full_smcs import register_full_smcs_hooks
-from tools.quant_layerwise_pipeline import (
+from tools.pipeline_common import (
     build_calibset,
     build_initial_hidden_cache,
     get_block,
@@ -48,16 +46,41 @@ from tools.quant_layerwise_pipeline import (
     propagate_block,
     save_json,
 )
-from transformers import AutoModelForCausalLM
+from transformers import AutoModel
+from utils.smcs import compute_z_for_weight, register_full_smcs_hooks
 from utils.generate_imp_mat import load_weight_from_checkpoint, load_weight_map
 
 
-STAGES = (
+LLADA_STAGES = (
     ("qkv", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
     ("attn_out", ("attn_out.weight",)),
     ("ff_in", ("ff_proj.weight", "up_proj.weight")),
     ("ff_out", ("ff_out.weight",)),
 )
+DREAM_STAGES = (
+    ("qkv", ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight")),
+    ("attn_out", ("self_attn.o_proj.weight",)),
+    ("ff_in", ("mlp.gate_proj.weight", "mlp.up_proj.weight")),
+    ("ff_out", ("mlp.down_proj.weight",)),
+)
+def block_family(block):
+    if all(hasattr(block, attr) for attr in ("q_proj", "k_proj", "v_proj", "ff_proj", "up_proj")):
+        return "llada"
+    if hasattr(block, "self_attn") and hasattr(block, "mlp"):
+        return "dream"
+    raise NotImplementedError(f"Unsupported transformer block: {type(block)}")
+
+
+def stage_definitions(block, requested_stages=""):
+    definitions = LLADA_STAGES if block_family(block) == "llada" else DREAM_STAGES
+    requested = {item.strip() for item in requested_stages.split(",") if item.strip()}
+    if not requested:
+        return definitions
+    valid = {name for name, _ in definitions}
+    unknown = requested - valid
+    if unknown:
+        raise ValueError(f"Unknown stages: {sorted(unknown)}; valid stages are {sorted(valid)}")
+    return tuple(item for item in definitions if item[0] in requested)
 
 
 def names_for_stage(block_names, suffixes):
@@ -87,8 +110,54 @@ def attention_residual(block, hidden):
     return hidden + block.dropout(att)
 
 
+def dream_position_ids(hidden):
+    position_ids = torch.arange(hidden.shape[1], device=hidden.device).unsqueeze(0)
+    if hidden.shape[0] > 1:
+        position_ids = position_ids.expand(hidden.shape[0], -1)
+    return position_ids
+
+
+def dream_attention_output(block, hidden):
+    normed = block.input_layernorm(hidden)
+    return block.self_attn(
+        hidden_states=normed,
+        attention_mask=None,
+        position_ids=dream_position_ids(hidden),
+        use_cache=False,
+    )[0]
+
+
 def run_stage_forward(block, stage_name, hidden):
     hidden = to_block_device(block, hidden)
+    family = block_family(block)
+    if family == "dream":
+        if stage_name == "qkv":
+            normed = block.input_layernorm(hidden)
+            q = block.self_attn.q_proj(normed)
+            k = block.self_attn.k_proj(normed)
+            v = block.self_attn.v_proj(normed)
+            del normed, q, k, v
+            return
+        if stage_name == "attn_out":
+            att = dream_attention_output(block, hidden)
+            del att
+            return
+        mid = hidden + dream_attention_output(block, hidden)
+        normed = block.post_attention_layernorm(mid)
+        if stage_name == "ff_in":
+            gate = block.mlp.gate_proj(normed)
+            up = block.mlp.up_proj(normed)
+            del mid, normed, gate, up
+            return
+        if stage_name == "ff_out":
+            gate = block.mlp.gate_proj(normed)
+            up = block.mlp.up_proj(normed)
+            gated = block.mlp.act_fn(gate) * up
+            out = block.mlp.down_proj(gated)
+            del mid, normed, gate, up, gated, out
+            return
+        raise ValueError(f"Unsupported stage: {stage_name}")
+
     if stage_name == "qkv":
         q, k, v = qkv_forward(block, hidden)
         del q, k, v
@@ -120,8 +189,7 @@ def collect_stage_covs(args, model, block_idx, stage_name, names, current_cache_
     if not names:
         return {}, {}
     block = get_block(model, block_idx)
-    if not all(hasattr(block, attr) for attr in ("q_proj", "k_proj", "v_proj", "ff_proj", "up_proj")):
-        raise NotImplementedError("Stage-wise pipeline currently supports LLaDA llama-style blocks only.")
+    block_family(block)
     print(f"Block {block_idx} stage {stage_name}: collecting SMCS for {len(names)} weights", flush=True)
     handles, covs, token_counts = register_full_smcs_hooks(
         model,
@@ -265,7 +333,8 @@ def stagewise_quantize_block(args, model, block_idx, block_names, current_cache,
     block_scores = {}
     block_tensor_map = {}
 
-    for stage_name, suffixes in STAGES:
+    block = get_block(model, block_idx)
+    for stage_name, suffixes in stage_definitions(block, args.stages):
         names = names_for_stage(block_names, suffixes)
         covs, token_counts = collect_stage_covs(args, model, block_idx, stage_name, names, current_cache)
         (
@@ -319,15 +388,22 @@ def main():
     validate_granularity_args(args)
     if args.only_build_z:
         raise NotImplementedError("Stage-wise mode quantizes each stage before later-stage statistics; --only_build_z is not supported.")
-    if args.start_block != 0:
-        raise NotImplementedError("Stage-wise quantized propagation currently requires --start_block 0.")
+    if args.start_block != 0 and not args.resume_stagewise:
+        raise NotImplementedError("Use --resume_stagewise with --start_block > 0 and an existing hidden cache/output directory.")
+    if args.resume_stagewise and args.start_block <= 0:
+        raise ValueError("--resume_stagewise requires --start_block > 0.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     z_cache_dir = Path(args.z_cache_dir) if args.z_cache_dir else output_dir / "z_cache"
     hidden_root = Path(args.hidden_cache_dir)
     hidden_root.mkdir(parents=True, exist_ok=True)
-    save_json(vars(args), output_dir / "stagewise_args.json")
+    args_file = (
+        output_dir / f"stagewise_resume_args_block_{args.start_block:02d}.json"
+        if args.resume_stagewise
+        else output_dir / "stagewise_args.json"
+    )
+    save_json(vars(args), args_file)
 
     weight_map = load_weight_map(args.model_path)
     target_weight_names = get_target_weight_names(weight_map)
@@ -338,7 +414,7 @@ def main():
     print(f"Stage-wise target blocks: {selected_blocks}", flush=True)
 
     print("Loading model", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModel.from_pretrained(
         args.model_path,
         trust_remote_code=True,
         torch_dtype=torch.float16,
@@ -349,16 +425,44 @@ def main():
     )
     model.eval()
 
-    calibset, mcs_step_count = build_calibset(args)
-    print(f"Calibration states={len(calibset)}, mcs_step_count={mcs_step_count}", flush=True)
-    current_cache = hidden_root / "block_00"
-    build_initial_hidden_cache(args, model, calibset, current_cache)
-    del calibset
-    gc.collect()
-
-    all_precision_map = {}
-    all_scores = {}
-    quantized_tensor_map = {}
+    if args.resume_stagewise:
+        current_cache = hidden_root / f"block_{args.start_block:02d}"
+        manifest = current_cache / "manifest.json"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"Resume hidden cache is missing: {manifest}")
+        total_states = json.load(open(manifest))["total_states"]
+        mcs_step_count = args.num_steps
+        print(
+            f"Resuming stage-wise quantization at block {args.start_block}: "
+            f"hidden_states={total_states}, mcs_step_count={mcs_step_count}",
+            flush=True,
+        )
+        map_paths = {
+            "precision": output_dir / "precision_map.json",
+            "scores": output_dir / "importance_scores.json",
+            "tensors": output_dir / "quantized_tensor_map.json",
+        }
+        missing = [str(path) for path in map_paths.values() if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Resume output maps are missing: {missing}")
+        all_precision_map = json.load(open(map_paths["precision"]))
+        all_scores = json.load(open(map_paths["scores"]))
+        quantized_tensor_map = json.load(open(map_paths["tensors"]))
+        print(
+            f"Loaded resume maps: precision={len(all_precision_map)}, "
+            f"scores={len(all_scores)}, tensors={len(quantized_tensor_map)}",
+            flush=True,
+        )
+    else:
+        calibset, mcs_step_count = build_calibset(args)
+        print(f"Calibration states={len(calibset)}, mcs_step_count={mcs_step_count}", flush=True)
+        current_cache = hidden_root / "block_00"
+        build_initial_hidden_cache(args, model, calibset, current_cache)
+        del calibset
+        gc.collect()
+        all_precision_map = {}
+        all_scores = {}
+        quantized_tensor_map = {}
 
     for pos, block_idx in enumerate(selected_blocks):
         names = block_map[block_idx]

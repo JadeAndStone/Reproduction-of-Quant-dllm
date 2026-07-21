@@ -1,0 +1,6 @@
+accelerate
+huggingface_hub
+numpy
+safetensors
+torch
+transformers

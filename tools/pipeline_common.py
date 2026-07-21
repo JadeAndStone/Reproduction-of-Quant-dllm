@@ -9,43 +9,20 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import AutoModelForCausalLM
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from MCS import load_dataset as mcs
-from main import (
-    C4_TRAIN_URL,
-    MODEL_PATH,
-    block_weight_names,
-    build_max_memory,
-    compute_abmp_scores_from_cache,
-    compute_unit_abmp_scores_from_cache,
-    compute_z_and_inverse_factor,
-    copy_model_assets,
-    get_target_weight_names,
-    infer_num_layers,
-    quant_dtype,
-    quantize_blocks_from_cache,
-    rewrite_full_checkpoint,
-    score_to_precision,
-    should_apply_fulls_refine,
-    score_to_precision_grouped,
-    validate_granularity_args,
-    z_block_path,
-)
-from tools.build_full_smcs_z_cache import compute_z_for_weight
-from tools.diagnose_full_smcs import register_full_smcs_hooks
-from utils.generate_imp_mat import load_weight_map
+from main import C4_TRAIN_URL, MODEL_PATH, quant_dtype
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Layer-wise Quant-dLLM PTQ pipeline: MCS -> current block SMCS/Z -> "
-            "current block ABMP/DAQ -> quantized hidden propagation."
+            "Shared arguments and hidden-state cache utilities for the stage-wise "
+            "Quant-dLLM reproduction pipeline."
         )
     )
     parser.add_argument("--model_path", default=MODEL_PATH)
@@ -131,6 +108,16 @@ def parse_args():
     parser.add_argument("--hidden_save_dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--keep_hidden_cache", action="store_true")
     parser.add_argument("--reuse_initial_hidden", action="store_true")
+    parser.add_argument(
+        "--resume_stagewise",
+        action="store_true",
+        help="Resume stage-wise quantization from --start_block using an existing hidden cache and output maps.",
+    )
+    parser.add_argument(
+        "--stages",
+        default="",
+        help="Stage-wise only: comma-separated subset of qkv,attn_out,ff_in,ff_out.",
+    )
 
     parser.add_argument("--gpu_memory", default="15GiB")
     parser.add_argument("--cpu_memory", default="120GiB")
@@ -176,10 +163,23 @@ def module_device(module, fallback=None):
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def model_family(model):
+    core = model.model
+    if hasattr(core, "transformer") and hasattr(core.transformer, "blocks"):
+        return "llada"
+    if hasattr(core, "layers") and hasattr(core, "embed_tokens"):
+        return "dream"
+    raise NotImplementedError(f"Unsupported model core: {type(core)}")
+
+
 def get_block(model, block_idx):
-    if getattr(model.model.config, "block_group_size", 1) != 1:
-        raise NotImplementedError("Layer-wise pipeline currently requires block_group_size == 1.")
-    return model.model.transformer.blocks[block_idx]
+    core = model.model
+    family = model_family(model)
+    if family == "llada":
+        if getattr(core.config, "block_group_size", 1) != 1:
+            raise NotImplementedError("Layer-wise pipeline currently requires block_group_size == 1.")
+        return core.transformer.blocks[block_idx]
+    return core.layers[block_idx]
 
 
 def chunk_file(cache_dir, chunk_idx):
@@ -215,6 +215,11 @@ def save_hidden(path, hidden, dtype):
 
 def embed_inputs(model, input_ids):
     core = model.model
+    family = model_family(model)
+    if family == "dream":
+        embed_device = module_device(core.embed_tokens, fallback=getattr(core, "device", None))
+        return core.embed_tokens(input_ids.to(embed_device))
+
     embed_device = module_device(core.transformer.wte, fallback=getattr(core, "device", None))
     input_ids = input_ids.to(embed_device)
     x = core.transformer.wte(input_ids)
@@ -265,108 +270,18 @@ def forward_block(model, block_idx, hidden):
     block = get_block(model, block_idx)
     device = module_device(block, fallback=getattr(model.model, "device", None))
     hidden = hidden.to(device)
+    if model_family(model) == "dream":
+        position_ids = torch.arange(hidden.shape[1], device=device).unsqueeze(0)
+        if hidden.shape[0] > 1:
+            position_ids = position_ids.expand(hidden.shape[0], -1)
+        return block(
+            hidden,
+            attention_mask=None,
+            position_ids=position_ids,
+            use_cache=False,
+        )[0]
     output, _ = block(hidden, attention_bias=None, layer_past=None, use_cache=False)
     return output
-
-
-def collect_block_covs(args, model, block_idx, names, current_cache_dir):
-    print(f"Block {block_idx}: collecting layer-wise SMCS for {len(names)} weights", flush=True)
-    handles, covs, token_counts = register_full_smcs_hooks(
-        model,
-        names,
-        args.max_tokens_per_state,
-        args.seed + block_idx * 100000,
-    )
-    files = list_chunk_files(current_cache_dir)
-    try:
-        with torch.no_grad():
-            for idx, path in enumerate(files, start=1):
-                hidden = load_hidden(path)
-                output = forward_block(model, block_idx, hidden)
-                del hidden, output
-                if idx == 1 or idx == len(files) or idx % 64 == 0:
-                    print(f"  block {block_idx}: collect chunk {idx}/{len(files)}", flush=True)
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-    finally:
-        for handle in handles:
-            handle.remove()
-    return covs, token_counts
-
-
-def save_block_z(args, block_idx, names, covs, token_counts, mcs_step_count, weight_map, z_cache_dir):
-    z_cache_dir = Path(z_cache_dir)
-    z_cache_dir.mkdir(parents=True, exist_ok=True)
-    tensors = {}
-    reports = {}
-    inverse_chol_map = {}
-    activation_diag_map = {}
-    fulls_cov_map = {}
-    fulls_normalizer_map = {}
-    for name in names:
-        normalizer = token_counts[name] if args.mcs_normalization == "tokens" else mcs_step_count
-        print(f"  block {block_idx}: inverse+Z {name}, normalizer={normalizer}", flush=True)
-        if getattr(args, "daq_activation_diag", False):
-            activation_diag_map[name] = (
-                torch.diagonal(covs[name]).detach().cpu().to(torch.float32) / float(normalizer)
-            ).contiguous()
-        if should_apply_fulls_refine(args, name):
-            fulls_cov_map[name] = covs[name].detach().cpu().to(torch.float32).contiguous()
-            fulls_normalizer_map[name] = int(normalizer)
-        if args.gptq_compensation:
-            z_tensor, inverse_info, inverse_chol_upper = compute_z_and_inverse_factor(
-                args,
-                name,
-                covs[name],
-                normalizer,
-                weight_map,
-            )
-            inverse_chol_map[name] = inverse_chol_upper
-        else:
-            z_tensor, inverse_info = compute_z_for_weight(args, name, covs[name], normalizer, weight_map)
-        tensors[name] = z_tensor.to(quant_dtype(args.z_save_dtype)).contiguous()
-        reports[name] = inverse_info
-        del z_tensor, covs[name]
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    out_path = z_block_path(z_cache_dir, block_idx)
-    save_file(tensors, str(out_path), metadata={"format": "pt"})
-    save_json(reports, z_cache_dir / f"block_{block_idx:02d}_inverse_report.json")
-    del tensors
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return out_path, inverse_chol_map, activation_diag_map, fulls_cov_map, fulls_normalizer_map
-
-
-def precision_for_block(args, block_idx, names, z_cache_dir):
-    block_map = {block_idx: names}
-    if args.skip_abmp:
-        return {name: args.default_bits for name in names}, {}
-    if args.abmp_granularity == "weight":
-        scores = compute_abmp_scores_from_cache(block_map, z_cache_dir)
-        precision_map = score_to_precision(scores, args.allocate_ratio)
-    else:
-        scores, score_groups = compute_unit_abmp_scores_from_cache(args, block_map, z_cache_dir)
-        precision_map = score_to_precision_grouped(scores, score_groups, args.allocate_ratio)
-    return precision_map, scores
-
-
-def apply_quantized_tensors(model, tensor_map):
-    modules = dict(model.named_modules())
-    for weight_name, tensor_path in tensor_map.items():
-        module_name = weight_name[: -len(".weight")]
-        if module_name not in modules:
-            raise KeyError(f"Missing module for {weight_name}: {module_name}")
-        module = modules[module_name]
-        with safe_open(str(tensor_path), framework="pt", device="cpu") as handle:
-            tensor = handle.get_tensor(weight_name)
-        if module.weight.device.type == "meta":
-            raise RuntimeError(f"Cannot update meta tensor for {weight_name}; use a device map that keeps blocks materialized.")
-        module.weight.data.copy_(tensor.to(device=module.weight.device, dtype=module.weight.dtype))
-        del tensor
 
 
 def propagate_block(args, model, block_idx, current_cache_dir, next_cache_dir):
@@ -396,138 +311,3 @@ def propagate_block(args, model, block_idx, current_cache_dir, next_cache_dir):
     write_manifest(next_cache_dir, total_states, args.hidden_chunk_size, first_shape, args.hidden_save_dtype)
 
 
-def main():
-    args = parse_args()
-    validate_granularity_args(args)
-    if args.start_block != 0:
-        raise NotImplementedError("Layer-wise quantized propagation currently requires --start_block 0.")
-    if args.hidden_chunk_size <= 0:
-        raise ValueError("--hidden_chunk_size must be positive.")
-
-    output_dir = Path(args.output_dir)
-    if output_dir.resolve() == Path(args.model_path).resolve():
-        raise ValueError("--output_dir must not equal --model_path.")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    z_cache_dir = Path(args.z_cache_dir) if args.z_cache_dir else output_dir / "z_cache"
-    hidden_root = Path(args.hidden_cache_dir)
-    hidden_root.mkdir(parents=True, exist_ok=True)
-
-    metadata = vars(args).copy()
-    save_json(metadata, output_dir / "layerwise_args.json")
-
-    weight_map = load_weight_map(args.model_path)
-    target_weight_names = get_target_weight_names(weight_map)
-    num_layers = infer_num_layers(target_weight_names)
-    end_block = args.end_block if args.end_block is not None else num_layers
-    selected_blocks = list(range(args.start_block, min(end_block, num_layers)))
-    block_map = {idx: block_weight_names(target_weight_names, idx) for idx in selected_blocks}
-    print(f"Layer-wise target blocks: {selected_blocks}", flush=True)
-    print(f"Target weights: {sum(len(v) for v in block_map.values())}", flush=True)
-
-    print("Loading model", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="auto",
-        max_memory=build_max_memory(args),
-        offload_folder=args.offload_folder,
-    )
-    model.eval()
-
-    calibset, mcs_step_count = build_calibset(args)
-    print(
-        f"Calibration states={len(calibset)}, mcs_step_count={mcs_step_count}, "
-        f"mcs_normalization={args.mcs_normalization}",
-        flush=True,
-    )
-    current_cache = hidden_root / "block_00"
-    build_initial_hidden_cache(args, model, calibset, current_cache)
-    del calibset
-    gc.collect()
-
-    all_precision_map = {}
-    all_scores = {}
-    quantized_tensor_map = {}
-
-    for pos, block_idx in enumerate(selected_blocks):
-        names = block_map[block_idx]
-        print(f"===== Layer-wise block {block_idx} ({pos + 1}/{len(selected_blocks)}) =====", flush=True)
-        covs, token_counts = collect_block_covs(args, model, block_idx, names, current_cache)
-        (
-            z_path,
-            block_inverse_chol_map,
-            block_activation_diag_map,
-            block_fulls_cov_map,
-            block_fulls_normalizer_map,
-        ) = save_block_z(
-            args,
-            block_idx,
-            names,
-            covs,
-            token_counts,
-            mcs_step_count,
-            weight_map,
-            z_cache_dir,
-        )
-        print(f"Block {block_idx}: saved Z to {z_path}", flush=True)
-        del covs, token_counts
-        gc.collect()
-
-        if args.only_build_z:
-            block_precision_map = {name: args.default_bits for name in names}
-            scores = {}
-        else:
-            block_precision_map, scores = precision_for_block(args, block_idx, names, z_cache_dir)
-            all_precision_map.update(block_precision_map)
-            all_scores.update(scores)
-            save_json(all_precision_map, output_dir / "precision_map.json")
-            if scores:
-                save_json(all_scores, output_dir / "importance_scores.json")
-
-            block_quantized_map = quantize_blocks_from_cache(
-                args,
-                weight_map,
-                {block_idx: names},
-                block_precision_map,
-                z_cache_dir,
-                cov_map=block_fulls_cov_map,
-                normalizer_map=block_fulls_normalizer_map,
-                inverse_chol_map=block_inverse_chol_map,
-                activation_diag_map=block_activation_diag_map,
-            )
-            quantized_tensor_map.update(block_quantized_map)
-            save_json(quantized_tensor_map, output_dir / "quantized_tensor_map.json")
-            apply_quantized_tensors(model, block_quantized_map)
-
-        del block_inverse_chol_map, block_activation_diag_map, block_fulls_cov_map, block_fulls_normalizer_map
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        is_last = pos == len(selected_blocks) - 1
-        if not is_last:
-            next_cache = hidden_root / f"block_{block_idx + 1:02d}"
-            # In normal PTQ mode this propagates with the just-quantized block.
-            # In --only_build_z mode the block remains FP, so the cache is FP-propagated.
-            propagate_block(args, model, block_idx, current_cache, next_cache)
-            if not args.keep_hidden_cache:
-                shutil.rmtree(current_cache)
-            current_cache = next_cache
-
-    if args.only_build_z:
-        print(f"Layer-wise Z cache ready at {z_cache_dir}", flush=True)
-        return
-
-    save_json(all_precision_map, output_dir / "precision_map.json")
-    save_json(quantized_tensor_map, output_dir / "quantized_tensor_map.json")
-    copy_model_assets(args.model_path, output_dir)
-    rewrite_full_checkpoint(args.model_path, output_dir, quantized_tensor_map)
-    if not args.keep_hidden_cache and current_cache.exists():
-        shutil.rmtree(current_cache)
-    print(f"Saved layer-wise fake-quantized model to {output_dir}", flush=True)
-
-
-if __name__ == "__main__":
-    main()
